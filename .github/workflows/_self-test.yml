@@ -1,0 +1,51 @@
+name: Self-Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'orchestrator/**'
+      - '.github/workflows/**'
+      - 'actions/**'
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-yaml:
+    name: Lint Workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate YAML syntax
+        run: |
+          FAILED=0
+          for f in .github/workflows/*.yml actions/*/action.yml; do
+            echo "Checking $f..."
+            python3 -c "
+          import yaml, sys
+          with open(sys.argv[1]) as fh:
+              yaml.safe_load(fh)
+          " "$f" || { echo "::error::Invalid YAML: $f"; FAILED=1; }
+          done
+          [ "$FAILED" -eq 0 ] && echo "All YAML files are valid"
+          exit $FAILED
+
+  test-orchestrator:
+    name: Orchestrator Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run tests
+        working-directory: orchestrator
+        run: python -m pytest tests/ -v
+
+  test-init-script:
+    name: Init Script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify init.sh syntax
+        run: bash -n init/init.sh

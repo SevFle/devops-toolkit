@@ -1,0 +1,166 @@
+name: Deploy to Staging
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        type: string
+        required: true
+        description: 'Application name (used for container and tag prefix)'
+      deploy_dir:
+        type: string
+        required: true
+        description: 'Remote deployment directory (e.g., /opt/services/apps/myapp-beta)'
+      image_name:
+        type: string
+        required: true
+        description: 'Docker image name (e.g., ghcr.io/owner/repo)'
+      docker_compose_path:
+        type: string
+        default: 'docker-compose.yml'
+      health_check_wait:
+        type: number
+        default: 50
+        description: 'Seconds to wait for health check after deploy'
+      env_vars:
+        type: string
+        default: ''
+        description: 'Newline-separated KEY=VALUE pairs for runtime env'
+      required_env_vars:
+        type: string
+        default: ''
+        description: 'Comma-separated required env var names to validate'
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      DEPLOY_HOST:
+        required: true
+      DEPLOY_USER:
+        required: true
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_PORT:
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Compute staging version
+        id: version
+        run: |
+          # Try package.json first, fallback to git tag
+          if [ -f package.json ]; then
+            BASE_VERSION=$(jq -r .version package.json 2>/dev/null || echo "0.0.0")
+          else
+            BASE_VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.0.0")
+          fi
+          PREFIX="v${BASE_VERSION}-beta-"
+          git fetch --tags --force
+          LAST_TAG=$(git tag --list "${PREFIX}*" | sort -V | tail -n 1 || true)
+
+          if [ -z "$LAST_TAG" ]; then
+            NEXT_BETA=1
+          else
+            LAST_NUM=${LAST_TAG##*-beta-}
+            if [ -z "$LAST_NUM" ] || ! echo "$LAST_NUM" | grep -Eq '^[0-9]+$'; then
+              NEXT_BETA=1
+            else
+              NEXT_BETA=$((LAST_NUM + 1))
+            fi
+          fi
+
+          VERSION="${PREFIX}${NEXT_BETA}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create staging tag
+        run: |
+          git tag "${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.version }}"
+
+      - name: Build Docker image
+        uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ inputs.image_name }}:beta
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Transfer image to VPS
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          docker save ${{ inputs.image_name }}:beta | \
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -p ${{ secrets.DEPLOY_PORT || 22 }} \
+                -i ~/.ssh/deploy_key \
+                ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+                'docker load'
+          rm -f ~/.ssh/deploy_key
+
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          script: |
+            set -e
+            cd ${{ inputs.deploy_dir }}
+
+            # Write env file if provided
+            if [ -n "${{ inputs.env_vars }}" ]; then
+              TMP_ENV=$(mktemp)
+              echo "${{ inputs.env_vars }}" > "$TMP_ENV"
+
+              # Validate required vars
+              IFS=',' read -ra REQUIRED <<< "${{ inputs.required_env_vars }}"
+              for var in "${REQUIRED[@]}"; do
+                var=$(echo "$var" | xargs)
+                if [ -n "$var" ] && ! grep -Eq "^${var}=.+$" "$TMP_ENV"; then
+                  echo "Missing required: $var"
+                  rm -f "$TMP_ENV"
+                  exit 1
+                fi
+              done
+
+              TMP_OVERRIDE=$(mktemp)
+              cat > "$TMP_OVERRIDE" <<EOF
+            services:
+              ${{ inputs.app_name }}:
+                env_file:
+                  - $TMP_ENV
+            EOF
+
+              docker compose -f ${{ inputs.docker_compose_path }} -f "$TMP_OVERRIDE" down || true
+              docker compose -f ${{ inputs.docker_compose_path }} -f "$TMP_OVERRIDE" up -d
+              sleep ${{ inputs.health_check_wait }}
+              rm -f "$TMP_OVERRIDE" "$TMP_ENV"
+            else
+              docker compose -f ${{ inputs.docker_compose_path }} down || true
+              docker compose -f ${{ inputs.docker_compose_path }} up -d
+              sleep ${{ inputs.health_check_wait }}
+            fi
+
+            if docker ps | grep "${{ inputs.app_name }}" | grep -q "healthy"; then
+              echo "Deployment successful!"
+            else
+              echo "Health check failed!"
+              docker ps -a | grep "${{ inputs.app_name }}"
+              docker logs "${{ inputs.app_name }}" --tail 50
+              exit 1
+            fi

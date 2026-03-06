@@ -1,0 +1,14 @@
+name: OpenSpec Orchestrate
+on:
+  workflow_dispatch:
+    inputs:
+      change_name:
+        description: 'OpenSpec change name'
+        required: true
+jobs:
+  orchestrate:
+    uses: SevFle/devops-toolkit/.github/workflows/openspec-orchestrate.yml@main
+    with:
+      change_name: ${{ inputs.change_name }}
+      base_branch: {{BASE_BRANCH}}
+    secrets: inherit

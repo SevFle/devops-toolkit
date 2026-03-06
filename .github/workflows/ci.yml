@@ -1,0 +1,198 @@
+name: CI Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        type: string
+        default: '22'
+        description: 'Node.js version'
+      package_manager:
+        type: string
+        default: 'npm'
+        description: 'Package manager (npm or pnpm)'
+      install_command:
+        type: string
+        default: 'npm ci'
+        description: 'Dependency install command'
+      test_command:
+        type: string
+        default: 'npm test'
+        description: 'Unit test command'
+      build_command:
+        type: string
+        default: 'npm run build'
+        description: 'Build command'
+      lint_command:
+        type: string
+        default: 'npm run lint'
+        description: 'Lint command'
+      typecheck_command:
+        type: string
+        default: 'npm run type-check'
+        description: 'Type check command'
+      coverage_command:
+        type: string
+        default: ''
+        description: 'Coverage command (skip if empty)'
+      coverage_threshold:
+        type: number
+        default: 75
+        description: 'Minimum coverage percentage'
+      docker_build:
+        type: boolean
+        default: false
+        description: 'Whether to build Docker image'
+      working_directory:
+        type: string
+        default: '.'
+        description: 'Working directory'
+      skip_branch_filter:
+        type: string
+        default: 'openspec-auto/'
+        description: 'Skip CI for branches matching this prefix'
+      e2e_enabled:
+        type: boolean
+        default: false
+        description: 'Run E2E tests in CI'
+      e2e_command:
+        type: string
+        default: 'npx playwright test'
+        description: 'E2E test command'
+      runners:
+        type: string
+        default: 'self-hosted'
+        description: 'Runner label(s), JSON array or string'
+
+jobs:
+  install:
+    name: Install Dependencies
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.package_manager }}
+      - run: ${{ inputs.install_command }}
+        working-directory: ${{ inputs.working_directory }}
+      - uses: actions/cache/save@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml') }}
+
+  type-check:
+    name: Type Check
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    needs: install
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml') }}
+      - run: ${{ inputs.typecheck_command }}
+        working-directory: ${{ inputs.working_directory }}
+
+  lint:
+    name: Lint
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    needs: install
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml') }}
+      - run: ${{ inputs.lint_command }}
+        working-directory: ${{ inputs.working_directory }}
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    needs: install
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml') }}
+      - name: Run tests
+        run: ${{ inputs.test_command }}
+        working-directory: ${{ inputs.working_directory }}
+      - name: Generate coverage
+        if: inputs.coverage_command != ''
+        run: ${{ inputs.coverage_command }}
+        working-directory: ${{ inputs.working_directory }}
+
+  build:
+    name: Build
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    needs: install
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml') }}
+      - name: Build
+        run: ${{ inputs.build_command }}
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          NODE_ENV: production
+
+  docker-build:
+    name: Docker Build
+    if: inputs.docker_build
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    needs: install
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.working_directory }}
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  ci-status:
+    name: CI Status
+    if: always()
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    needs: [type-check, lint, unit-tests, build, docker-build]
+    steps:
+      - name: Check results
+        run: |
+          echo "Type Check: ${{ needs.type-check.result }}"
+          echo "Lint: ${{ needs.lint.result }}"
+          echo "Tests: ${{ needs.unit-tests.result }}"
+          echo "Build: ${{ needs.build.result }}"
+          echo "Docker: ${{ needs.docker-build.result }}"
+
+          if [[ "${{ needs.type-check.result }}" == "failure" ]] || \
+             [[ "${{ needs.lint.result }}" == "failure" ]] || \
+             [[ "${{ needs.unit-tests.result }}" == "failure" ]] || \
+             [[ "${{ needs.build.result }}" == "failure" ]]; then
+            echo "::error::CI checks failed"
+            exit 1
+          fi
+
+          if [[ "${{ needs.docker-build.result }}" == "failure" ]]; then
+            echo "::error::Docker build failed"
+            exit 1
+          fi
+
+          echo "All CI checks passed!"

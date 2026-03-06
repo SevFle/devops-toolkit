@@ -1,0 +1,180 @@
+name: 'Claude Run'
+description: 'Run Claude CLI with a prompt and parse structured output'
+
+inputs:
+  prompt:
+    description: 'The prompt to send to Claude (plaintext or base64 if is_encoded=true)'
+    required: true
+  prompt_file:
+    description: 'Path to a file containing the prompt (alternative to prompt input)'
+    required: false
+  model:
+    description: 'Claude model to use'
+    required: false
+    default: 'claude-sonnet-4-5-20250514'
+  max_turns:
+    description: 'Maximum conversation turns'
+    required: false
+    default: '1'
+  is_encoded:
+    description: 'Whether the prompt is base64-encoded'
+    required: false
+    default: 'false'
+  output_format:
+    description: 'Output format (text or json)'
+    required: false
+    default: 'text'
+  allowed_tools:
+    description: 'Comma-separated list of allowed tools (empty = none)'
+    required: false
+    default: ''
+  use_github_token:
+    description: 'Set GITHUB_TOKEN for Claude'
+    required: false
+    default: 'false'
+
+outputs:
+  response:
+    description: 'Full response from Claude'
+    value: ${{ steps.run.outputs.response }}
+  question_step:
+    description: 'Extracted OPENSPEC_QUESTION_STEP marker'
+    value: ${{ steps.parse.outputs.question_step }}
+  question_content:
+    description: 'Extracted OPENSPEC_QUESTION marker'
+    value: ${{ steps.parse.outputs.question_content }}
+  interview_complete:
+    description: 'Extracted OPENSPEC_INTERVIEW_COMPLETE marker'
+    value: ${{ steps.parse.outputs.interview_complete }}
+  change_id:
+    description: 'Extracted OPENSPEC_CHANGE_ID marker'
+    value: ${{ steps.parse.outputs.change_id }}
+  agent_error:
+    description: 'Error type if agent failed'
+    value: ${{ steps.parse.outputs.agent_error }}
+  agent_error_reason:
+    description: 'Error reason if agent failed'
+    value: ${{ steps.parse.outputs.agent_error_reason }}
+  schema_valid:
+    description: 'Whether output passed schema validation'
+    value: ${{ steps.parse.outputs.schema_valid }}
+  validation_errors:
+    description: 'Schema validation error details'
+    value: ${{ steps.parse.outputs.validation_errors }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Verify Claude CLI
+      shell: bash
+      run: |
+        if ! command -v claude &> /dev/null; then
+          echo "::error::Claude CLI not found. Install it first."
+          exit 1
+        fi
+        claude --version || true
+
+    - name: Prepare prompt
+      id: prepare
+      shell: bash
+      run: |
+        PROMPT_FILE=$(mktemp /tmp/claude-prompt-XXXXXX.md)
+
+        if [ -n "${{ inputs.prompt_file }}" ] && [ -f "${{ inputs.prompt_file }}" ]; then
+          cp "${{ inputs.prompt_file }}" "$PROMPT_FILE"
+        elif [ "${{ inputs.is_encoded }}" = "true" ]; then
+          echo "${{ inputs.prompt }}" | base64 -d > "$PROMPT_FILE"
+        else
+          cat > "$PROMPT_FILE" << 'PROMPT_EOF'
+        ${{ inputs.prompt }}
+        PROMPT_EOF
+        fi
+
+        echo "prompt_file=$PROMPT_FILE" >> $GITHUB_OUTPUT
+
+    - name: Run Claude
+      id: run
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ env.ANTHROPIC_API_KEY }}
+      run: |
+        RESPONSE_FILE=$(mktemp /tmp/claude-response-XXXXXX.txt)
+
+        CLAUDE_ARGS="-p --model ${{ inputs.model }} --max-turns ${{ inputs.max_turns }} --output-format ${{ inputs.output_format }}"
+
+        if [ -n "${{ inputs.allowed_tools }}" ]; then
+          CLAUDE_ARGS="$CLAUDE_ARGS --allowedTools ${{ inputs.allowed_tools }}"
+        else
+          CLAUDE_ARGS="$CLAUDE_ARGS --allowedTools \"\""
+        fi
+
+        cat "${{ steps.prepare.outputs.prompt_file }}" | claude $CLAUDE_ARGS > "$RESPONSE_FILE" 2>&1 || true
+
+        # Truncate response for GITHUB_OUTPUT (max 1MB)
+        RESPONSE=$(head -c 900000 "$RESPONSE_FILE")
+
+        # Use delimiter for multiline output
+        EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
+        {
+          echo "response<<${EOF_MARKER}"
+          echo "$RESPONSE"
+          echo "${EOF_MARKER}"
+        } >> $GITHUB_OUTPUT
+
+        echo "response_file=$RESPONSE_FILE" >> $GITHUB_OUTPUT
+
+    - name: Parse structured markers
+      id: parse
+      shell: bash
+      run: |
+        RESPONSE_FILE="${{ steps.run.outputs.response_file }}"
+        RESPONSE=$(cat "$RESPONSE_FILE" 2>/dev/null || echo "")
+
+        # Extract OPENSPEC markers
+        QUESTION_STEP=$(echo "$RESPONSE" | grep -oP 'OPENSPEC_QUESTION_STEP:\s*\K\d+' | head -1 || true)
+        echo "question_step=$QUESTION_STEP" >> $GITHUB_OUTPUT
+
+        QUESTION_CONTENT=$(echo "$RESPONSE" | sed -n 's/^OPENSPEC_QUESTION:\s*//p' | head -1 || true)
+        echo "question_content=$QUESTION_CONTENT" >> $GITHUB_OUTPUT
+
+        INTERVIEW_COMPLETE=$(echo "$RESPONSE" | grep -oP 'OPENSPEC_INTERVIEW_COMPLETE:\s*\K(true|false)' | head -1 || true)
+        echo "interview_complete=$INTERVIEW_COMPLETE" >> $GITHUB_OUTPUT
+
+        CHANGE_ID=$(echo "$RESPONSE" | grep -oP 'OPENSPEC_CHANGE_ID:\s*\K\S+' | head -1 || true)
+        echo "change_id=$CHANGE_ID" >> $GITHUB_OUTPUT
+
+        # Check for JSON error response
+        AGENT_ERROR=$(echo "$RESPONSE" | python3 -c "
+        import sys, json
+        try:
+            data = json.load(sys.stdin)
+            if isinstance(data, dict) and 'error' in data:
+                print(data['error'])
+        except: pass
+        " 2>/dev/null || true)
+        echo "agent_error=$AGENT_ERROR" >> $GITHUB_OUTPUT
+
+        AGENT_ERROR_REASON=$(echo "$RESPONSE" | python3 -c "
+        import sys, json
+        try:
+            data = json.load(sys.stdin)
+            if isinstance(data, dict) and 'reason' in data:
+                print(data['reason'])
+        except: pass
+        " 2>/dev/null || true)
+        echo "agent_error_reason=$AGENT_ERROR_REASON" >> $GITHUB_OUTPUT
+
+        # Schema validation (basic check)
+        if [ -n "$QUESTION_STEP" ] || [ -n "$INTERVIEW_COMPLETE" ] || [ -n "$CHANGE_ID" ]; then
+          echo "schema_valid=true" >> $GITHUB_OUTPUT
+          echo "validation_errors=" >> $GITHUB_OUTPUT
+        else
+          echo "schema_valid=unknown" >> $GITHUB_OUTPUT
+          echo "validation_errors=No structured markers found in output" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Cleanup
+      if: always()
+      shell: bash
+      run: |
+        rm -f "${{ steps.prepare.outputs.prompt_file }}" "${{ steps.run.outputs.response_file }}" 2>/dev/null || true

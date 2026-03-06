@@ -1,0 +1,18 @@
+name: Deploy Production
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to deploy'
+        required: true
+jobs:
+  deploy:
+    uses: SevFle/devops-toolkit/.github/workflows/deploy-production.yml@main
+    with:
+      app_name: {{APP_NAME}}-prod
+      deploy_dir: /opt/services/apps/{{APP_NAME}}-prod
+      image_name: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      version: ${{ inputs.version || github.event.release.tag_name }}
+    secrets: inherit

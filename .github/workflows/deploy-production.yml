@@ -1,0 +1,133 @@
+name: Deploy to Production
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        type: string
+        required: true
+      deploy_dir:
+        type: string
+        required: true
+      image_name:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+        description: 'Version tag for the image'
+      docker_compose_path:
+        type: string
+        default: 'docker-compose.yml'
+      health_check_wait:
+        type: number
+        default: 50
+      health_check_url:
+        type: string
+        default: ''
+        description: 'URL to check after deploy (optional)'
+      env_vars:
+        type: string
+        default: ''
+      required_env_vars:
+        type: string
+        default: ''
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      DEPLOY_HOST:
+        required: true
+      DEPLOY_USER:
+        required: true
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_PORT:
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ inputs.image_name }}:${{ inputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Transfer image to VPS
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          docker save ${{ inputs.image_name }}:${{ inputs.version }} | \
+            ssh -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -p ${{ secrets.DEPLOY_PORT || 22 }} \
+                -i ~/.ssh/deploy_key \
+                ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+                'docker load'
+          rm -f ~/.ssh/deploy_key
+
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          script: |
+            set -e
+            cd ${{ inputs.deploy_dir }}
+
+            if [ -n "${{ inputs.env_vars }}" ]; then
+              TMP_ENV=$(mktemp)
+              echo "${{ inputs.env_vars }}" > "$TMP_ENV"
+
+              IFS=',' read -ra REQUIRED <<< "${{ inputs.required_env_vars }}"
+              for var in "${REQUIRED[@]}"; do
+                var=$(echo "$var" | xargs)
+                if [ -n "$var" ] && ! grep -Eq "^${var}=.+$" "$TMP_ENV"; then
+                  echo "Missing required: $var"
+                  rm -f "$TMP_ENV"
+                  exit 1
+                fi
+              done
+
+              TMP_OVERRIDE=$(mktemp)
+              cat > "$TMP_OVERRIDE" <<EOF
+            services:
+              ${{ inputs.app_name }}:
+                env_file:
+                  - $TMP_ENV
+            EOF
+              docker compose -f ${{ inputs.docker_compose_path }} -f "$TMP_OVERRIDE" down || true
+              docker compose -f ${{ inputs.docker_compose_path }} -f "$TMP_OVERRIDE" up -d
+              sleep ${{ inputs.health_check_wait }}
+              rm -f "$TMP_OVERRIDE" "$TMP_ENV"
+            else
+              docker compose -f ${{ inputs.docker_compose_path }} down || true
+              docker compose -f ${{ inputs.docker_compose_path }} up -d
+              sleep ${{ inputs.health_check_wait }}
+            fi
+
+            if docker ps | grep "${{ inputs.app_name }}" | grep -q "healthy"; then
+              echo "Deployment successful!"
+            else
+              echo "Health check failed!"
+              docker ps -a | grep "${{ inputs.app_name }}"
+              docker logs "${{ inputs.app_name }}" --tail 50
+              exit 1
+            fi
+
+      - name: External health check
+        if: inputs.health_check_url != ''
+        run: |
+          sleep 10
+          curl -f "${{ inputs.health_check_url }}" || exit 1

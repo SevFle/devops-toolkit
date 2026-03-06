@@ -1,0 +1,14 @@
+[project]
+name = "devops-toolkit-orchestrator"
+version = "0.1.0"
+description = "AI-powered CI/CD orchestrator using Claude CLI"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

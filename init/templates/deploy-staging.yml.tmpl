@@ -1,0 +1,13 @@
+name: Deploy Staging
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  deploy:
+    uses: SevFle/devops-toolkit/.github/workflows/deploy-staging.yml@main
+    with:
+      app_name: {{APP_NAME}}-beta
+      deploy_dir: /opt/services/apps/{{APP_NAME}}-beta
+      image_name: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+    secrets: inherit

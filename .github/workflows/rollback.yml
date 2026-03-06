@@ -1,0 +1,140 @@
+name: Rollback
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        type: string
+        required: true
+      deploy_dir_staging:
+        type: string
+        default: ''
+      deploy_dir_production:
+        type: string
+        default: ''
+      image_name:
+        type: string
+        required: true
+      environment:
+        type: string
+        required: true
+        description: 'staging or production'
+      target_commit:
+        type: string
+        default: ''
+      reason:
+        type: string
+        required: true
+      node_version:
+        type: string
+        default: '22'
+      build_command:
+        type: string
+        default: 'npm run build'
+      install_command:
+        type: string
+        default: 'npm ci'
+      health_check_wait:
+        type: number
+        default: 50
+      env_vars:
+        type: string
+        default: ''
+      required_env_vars:
+        type: string
+        default: ''
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      DEPLOY_HOST:
+        required: true
+      DEPLOY_USER:
+        required: true
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_PORT:
+        required: false
+
+jobs:
+  rollback:
+    name: Rollback ${{ inputs.environment }}
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine target
+        id: target
+        run: |
+          if [ -n "${{ inputs.target_commit }}" ]; then
+            TARGET="${{ inputs.target_commit }}"
+          else
+            if [ "${{ inputs.environment }}" = "production" ]; then
+              TARGET=$(git log --format='%H' -n 2 origin/main | tail -1)
+            else
+              TARGET=$(git log --format='%H' -n 2 origin/develop | tail -1)
+            fi
+          fi
+          echo "commit=$TARGET" >> $GITHUB_OUTPUT
+
+      - run: git checkout ${{ steps.target.outputs.commit }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+      - run: ${{ inputs.install_command }}
+      - run: ${{ inputs.build_command }}
+        env:
+          NODE_ENV: production
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ inputs.image_name }}:rollback
+          cache-from: type=gha
+
+      - name: Deploy rollback
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          script: |
+            set -e
+            if [ "${{ inputs.environment }}" = "production" ]; then
+              DEPLOY_DIR="${{ inputs.deploy_dir_production }}"
+            else
+              DEPLOY_DIR="${{ inputs.deploy_dir_staging }}"
+            fi
+
+            cd "$DEPLOY_DIR"
+            docker compose down || true
+            docker compose up -d
+            sleep ${{ inputs.health_check_wait }}
+
+            if docker ps | grep "${{ inputs.app_name }}" | grep -q "healthy"; then
+              echo "Rollback successful!"
+            else
+              echo "Rollback health check failed!"
+              docker ps -a | grep "${{ inputs.app_name }}"
+              docker logs "${{ inputs.app_name }}" --tail 50
+              exit 1
+            fi
+
+      - name: Summary
+        run: |
+          echo "## Rollback Completed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Target** | \`${{ steps.target.outputs.commit }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Reason** | ${{ inputs.reason }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Actor** | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY

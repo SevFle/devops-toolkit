@@ -1,0 +1,95 @@
+name: E2E Tests
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        type: string
+        default: '22'
+      browsers:
+        type: string
+        default: '["chromium"]'
+        description: 'JSON array of browsers to test'
+      test_command:
+        type: string
+        default: 'npx playwright test'
+      build_command:
+        type: string
+        default: 'npm run build'
+      install_command:
+        type: string
+        default: 'npm ci'
+      start_command:
+        type: string
+        default: ''
+        description: 'Server start command (if needed)'
+      base_url:
+        type: string
+        default: 'http://localhost:3000'
+      timeout_minutes:
+        type: number
+        default: 120
+      runners:
+        type: string
+        default: 'self-hosted'
+
+jobs:
+  e2e:
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: ${{ fromJSON(inputs.browsers) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+      - run: ${{ inputs.install_command }}
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+      - name: Build
+        if: inputs.build_command != ''
+        run: ${{ inputs.build_command }}
+        env:
+          NODE_ENV: production
+      - name: Start server
+        if: inputs.start_command != ''
+        run: |
+          ${{ inputs.start_command }} &
+          echo $! > server.pid
+          sleep 5
+      - name: Wait for server
+        if: inputs.start_command != ''
+        run: |
+          for i in {1..30}; do
+            if curl -s -o /dev/null -w "%{http_code}" "${{ inputs.base_url }}" | grep -qE "^(200|301|302|304|404)$"; then
+              echo "Server is ready!"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          exit 1
+      - name: Run E2E tests
+        run: CI=false ${{ inputs.test_command }} --project=${{ matrix.browser }}
+        env:
+          PLAYWRIGHT_BASE_URL: ${{ inputs.base_url }}
+      - name: Stop server
+        if: always() && inputs.start_command != ''
+        run: |
+          if [ -f server.pid ]; then
+            kill $(cat server.pid) || true
+            rm server.pid
+          fi
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-results-${{ matrix.browser }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7

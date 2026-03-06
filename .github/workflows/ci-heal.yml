@@ -1,0 +1,104 @@
+name: CI Auto-Heal
+
+on:
+  workflow_call:
+    inputs:
+      ci_workflow_name:
+        type: string
+        default: 'CI Pipeline'
+        description: 'Name of the CI workflow to monitor'
+      max_attempts:
+        type: number
+        default: 3
+        description: 'Max heal attempts per branch'
+      ai_model:
+        type: string
+        default: 'claude-sonnet-4-5-20250514'
+        description: 'Claude model for fixes'
+      timeout_minutes:
+        type: number
+        default: 30
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      PAT_TOKEN:
+        required: true
+
+jobs:
+  auto-heal:
+    name: Auto-Heal CI Failures
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_branch != 'main' &&
+      github.event.workflow_run.head_branch != 'develop'
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+
+    steps:
+      - name: Get PR info
+        id: pr-info
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "run_id=$WORKFLOW_RUN_ID" >> $GITHUB_OUTPUT
+          echo "branch=$WORKFLOW_BRANCH" >> $GITHUB_OUTPUT
+
+          PR_URL=$(gh pr view "$WORKFLOW_BRANCH" --repo "$REPO" --json url --jq '.url' 2>/dev/null || echo "")
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+
+          HEAL_COUNT=$(gh pr view "$WORKFLOW_BRANCH" --repo "$REPO" --json commits --jq '[.commits[].messageHeadline | select(startswith("fix: CI auto-heal"))] | length' 2>/dev/null || echo "0")
+          echo "heal_count=$HEAL_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Check heal limit
+        if: steps.pr-info.outputs.heal_count >= inputs.max_attempts
+        run: |
+          echo "::warning::Auto-heal limit reached. Skipping."
+          exit 0
+
+      - name: Checkout PR branch
+        if: steps.pr-info.outputs.heal_count < inputs.max_attempts
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.pr-info.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Checkout devops-toolkit
+        if: steps.pr-info.outputs.heal_count < inputs.max_attempts
+        uses: actions/checkout@v6
+        with:
+          repository: SevFle/devops-toolkit
+          path: .devops-toolkit
+          ref: main
+
+      - name: Configure Git
+        if: steps.pr-info.outputs.heal_count < inputs.max_attempts
+        run: |
+          git config user.name "devops-toolkit[bot]"
+          git config user.email "devops-toolkit[bot]@users.noreply.github.com"
+
+      - name: Run CI fix
+        if: steps.pr-info.outputs.heal_count < inputs.max_attempts
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          PYTHONPATH: .devops-toolkit/orchestrator
+          PR_URL: ${{ steps.pr-info.outputs.pr_url }}
+          RUN_ID: ${{ steps.pr-info.outputs.run_id }}
+          BRANCH: ${{ steps.pr-info.outputs.branch }}
+        run: |
+          PR_FLAG=""
+          if [ -n "$PR_URL" ]; then
+            PR_FLAG="--pr-url $PR_URL"
+          fi
+
+          python3 .devops-toolkit/orchestrator/ci_fix.py \
+            "$RUN_ID" \
+            --repo "${{ github.repository }}" \
+            --branch "$BRANCH" \
+            --max-attempts 2 \
+            $PR_FLAG

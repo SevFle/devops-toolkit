@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      version_bump:
+        type: string
+        required: true
+        description: 'major, minor, or patch'
+      pre_release:
+        type: boolean
+        default: false
+      dry_run:
+        type: boolean
+        default: false
+      node_version:
+        type: string
+        default: '22'
+      test_command:
+        type: string
+        default: 'npm test'
+      build_command:
+        type: string
+        default: 'npm run build'
+      lint_command:
+        type: string
+        default: 'npm run lint'
+      typecheck_command:
+        type: string
+        default: 'npm run type-check'
+      publish_npm:
+        type: boolean
+        default: false
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      NPM_TOKEN:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        id: bump
+        run: |
+          if [ "${{ inputs.pre_release }}" = "true" ]; then
+            PRE_ID="beta.$(date +%Y%m%d%H%M%S)"
+            NEW_VERSION=$(npm version ${{ inputs.version_bump }} --preid=$PRE_ID --no-git-tag-version | sed 's/^v//')
+          else
+            NEW_VERSION=$(npm version ${{ inputs.version_bump }} --no-git-tag-version | sed 's/^v//')
+          fi
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - run: npm ci
+      - run: ${{ inputs.test_command }}
+      - run: ${{ inputs.typecheck_command }}
+      - run: ${{ inputs.build_command }}
+      - run: ${{ inputs.lint_command }}
+
+      - name: Commit and tag
+        run: |
+          git add package.json package-lock.json
+          git commit -m "chore(release): bump version to v${{ steps.bump.outputs.version }}"
+          git tag v${{ steps.bump.outputs.version }}
+          git push origin HEAD
+          git push origin v${{ steps.bump.outputs.version }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.bump.outputs.version }}
+          name: Release v${{ steps.bump.outputs.version }}
+          draft: false
+          prerelease: ${{ inputs.pre_release }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to npm
+        if: inputs.publish_npm && !inputs.dry_run
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "### Release Complete" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** v${{ steps.bump.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Type:** ${{ inputs.version_bump }}" >> $GITHUB_STEP_SUMMARY

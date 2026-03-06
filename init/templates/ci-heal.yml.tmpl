@@ -1,0 +1,9 @@
+name: CI Auto-Heal
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+jobs:
+  heal:
+    uses: SevFle/devops-toolkit/.github/workflows/ci-heal.yml@main
+    secrets: inherit
