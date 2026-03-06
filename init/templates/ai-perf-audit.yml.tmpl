@@ -1,0 +1,9 @@
+name: Performance Audit
+on:
+  schedule:
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+jobs:
+  audit:
+    uses: SevFle/devops-toolkit/.github/workflows/ai-perf-audit.yml@main
+    secrets: inherit

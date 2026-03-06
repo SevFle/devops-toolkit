@@ -1,0 +1,252 @@
+name: AI Tech Debt Scanner
+
+on:
+  workflow_call:
+    inputs:
+      ai_model:
+        type: string
+        default: 'claude-sonnet-4-5-20250514'
+        description: 'Claude model for analysis'
+      categories:
+        type: string
+        default: 'all'
+        description: 'Comma-separated categories: hotspots,smells,outdated,todos,deps (or all)'
+      max_items_per_category:
+        type: number
+        default: 10
+        description: 'Maximum items to report per category'
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  tech-debt-scan:
+    name: Tech Debt Scan
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Collect codebase context
+        id: context
+        run: |
+          set -euo pipefail
+
+          CONTEXT_FILE=$(mktemp /tmp/tech-debt-context-XXXXXX.md)
+
+          # File listing with sizes
+          echo "## File Listing (with line counts)" >> "$CONTEXT_FILE"
+          echo '```' >> "$CONTEXT_FILE"
+          find . -type f \
+            -not -path './.git/*' \
+            -not -path './node_modules/*' \
+            -not -path './__pycache__/*' \
+            -not -path './vendor/*' \
+            -not -path './dist/*' \
+            -not -path './build/*' \
+            -not -path './.devops-toolkit/*' \
+            -exec wc -l {} + 2>/dev/null | sort -rn | head -100 >> "$CONTEXT_FILE"
+          echo '```' >> "$CONTEXT_FILE"
+
+          # TODO/FIXME/HACK comments
+          echo "" >> "$CONTEXT_FILE"
+          echo "## TODO/FIXME/HACK Comments" >> "$CONTEXT_FILE"
+          echo '```' >> "$CONTEXT_FILE"
+          grep -rnE '(TODO|FIXME|HACK|XXX|TEMP|WORKAROUND)' \
+            --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" \
+            --include="*.py" --include="*.go" --include="*.rs" --include="*.java" \
+            --include="*.rb" --include="*.yml" --include="*.yaml" \
+            . 2>/dev/null | grep -v 'node_modules\|vendor\|dist\|build\|\.git' | head -200 >> "$CONTEXT_FILE" || echo "None found" >> "$CONTEXT_FILE"
+          echo '```' >> "$CONTEXT_FILE"
+
+          # Dependency versions
+          echo "" >> "$CONTEXT_FILE"
+          echo "## Dependency Manifests" >> "$CONTEXT_FILE"
+          for manifest in package.json requirements.txt go.mod Cargo.toml pyproject.toml pom.xml build.gradle Gemfile; do
+            if [ -f "$manifest" ]; then
+              echo "" >> "$CONTEXT_FILE"
+              echo "### $manifest" >> "$CONTEXT_FILE"
+              echo '```' >> "$CONTEXT_FILE"
+              cat "$manifest" >> "$CONTEXT_FILE"
+              echo '```' >> "$CONTEXT_FILE"
+            fi
+          done
+
+          # Sample of largest source files (for complexity analysis)
+          echo "" >> "$CONTEXT_FILE"
+          echo "## Largest Source Files (first 200 lines each)" >> "$CONTEXT_FILE"
+          find . -type f \( -name "*.ts" -o -name "*.js" -o -name "*.py" -o -name "*.go" \) \
+            -not -path './.git/*' -not -path './node_modules/*' -not -path './vendor/*' \
+            -not -path './dist/*' -not -path './build/*' \
+            -exec wc -l {} + 2>/dev/null | sort -rn | head -11 | tail -10 | awk '{print $2}' | while read -r file; do
+            if [ -f "$file" ]; then
+              echo "" >> "$CONTEXT_FILE"
+              echo "### $file" >> "$CONTEXT_FILE"
+              echo '```' >> "$CONTEXT_FILE"
+              head -200 "$file" >> "$CONTEXT_FILE"
+              echo '```' >> "$CONTEXT_FILE"
+            fi
+          done
+
+          echo "context_file=$CONTEXT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare prompt
+        id: prompt
+        env:
+          CATEGORIES: ${{ inputs.categories }}
+          MAX_ITEMS: ${{ inputs.max_items_per_category }}
+        run: |
+          set -euo pipefail
+
+          PROMPT_FILE=$(mktemp /tmp/tech-debt-prompt-XXXXXX.md)
+
+          cat .devops-toolkit/prompts/tech-debt-scan.prompt.md > "$PROMPT_FILE"
+
+          echo "" >> "$PROMPT_FILE"
+          echo "---" >> "$PROMPT_FILE"
+          echo "" >> "$PROMPT_FILE"
+          echo "## Configuration" >> "$PROMPT_FILE"
+          echo "- categories: $CATEGORIES" >> "$PROMPT_FILE"
+          echo "- max_items_per_category: $MAX_ITEMS" >> "$PROMPT_FILE"
+          echo "" >> "$PROMPT_FILE"
+          cat "${{ steps.context.outputs.context_file }}" >> "$PROMPT_FILE"
+
+          echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          RESPONSE_FILE=$(mktemp /tmp/tech-debt-response-XXXXXX.txt)
+
+          cat "${{ steps.prompt.outputs.prompt_file }}" | claude -p \
+            --model "${{ inputs.ai_model }}" \
+            --max-turns 1 \
+            --allowedTools "" \
+            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+
+          echo "response_file=$RESPONSE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Parse structured report
+        id: parse
+        run: |
+          set -euo pipefail
+
+          RESPONSE_FILE="${{ steps.claude.outputs.response_file }}"
+          JSON_FILE=$(mktemp /tmp/tech-debt-json-XXXXXX.json)
+
+          if sed -n '/^```json$/,/^```$/p' "$RESPONSE_FILE" | sed '1d;$d' > "$JSON_FILE" 2>/dev/null && [ -s "$JSON_FILE" ]; then
+            if python3 -c "import json; json.load(open('$JSON_FILE'))" 2>/dev/null; then
+              echo "json_valid=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "json_valid=false" >> "$GITHUB_OUTPUT"
+              cat "$RESPONSE_FILE" > "$JSON_FILE"
+            fi
+          else
+            echo "json_valid=false" >> "$GITHUB_OUTPUT"
+            cat "$RESPONSE_FILE" > "$JSON_FILE"
+          fi
+
+          echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          JSON_FILE="${{ steps.parse.outputs.json_file }}"
+          BODY_FILE=$(mktemp /tmp/tech-debt-issue-XXXXXX.md)
+
+          cat > "$BODY_FILE" << 'HEADER'
+          ## Tech Debt Scan Report
+
+          Automated technical debt analysis. Each item includes effort estimates and suggested fixes.
+
+          HEADER
+
+          if [ "${{ steps.parse.outputs.json_valid }}" = "true" ]; then
+            python3 - "$JSON_FILE" >> "$BODY_FILE" << 'PYSCRIPT'
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+
+          def render_items(items, title):
+              if not items:
+                  return
+              print(f"### {title}\n")
+              print("| Priority | File | Description | Effort | Suggested Fix |")
+              print("|----------|------|-------------|--------|---------------|")
+              for item in items:
+                  priority = item.get("priority", "P3")
+                  file_loc = f"`{item.get('file', 'N/A')}"
+                  if item.get("line"):
+                      file_loc += f":{item['line']}"
+                  file_loc += "`"
+                  desc = item.get("description", "").replace("|", "/").replace("\n", " ")[:120]
+                  effort = f"{item.get('estimated_effort_hours', '?')}h"
+                  fix = item.get("suggested_fix", "").replace("|", "/").replace("\n", " ")[:120]
+                  print(f"| {priority} | {file_loc} | {desc} | {effort} | {fix} |")
+              print()
+
+          render_items(data.get("hotspots", []), "Complexity Hotspots")
+          render_items(data.get("smells", []), "Code Smells")
+          render_items(data.get("outdated", []), "Outdated Patterns")
+          render_items(data.get("todos", []), "TODO/FIXME/HACK Audit")
+          render_items(data.get("deps", []), "Dependency Freshness")
+
+          summary = data.get("summary", {})
+          if summary:
+              print("### Summary\n")
+              print(f"- **Total items:** {summary.get('total_items', 'N/A')}")
+              print(f"- **Total effort:** {summary.get('total_effort_hours', 'N/A')} hours")
+              bp = summary.get("by_priority", {})
+              if bp:
+                  print(f"- **P0:** {bp.get('P0', 0)} | **P1:** {bp.get('P1', 0)} | **P2:** {bp.get('P2', 0)} | **P3:** {bp.get('P3', 0)}")
+          PYSCRIPT
+          else
+            echo "### Raw Analysis Output" >> "$BODY_FILE"
+            echo "" >> "$BODY_FILE"
+            echo '```' >> "$BODY_FILE"
+            head -c 60000 "$JSON_FILE" >> "$BODY_FILE"
+            echo '```' >> "$BODY_FILE"
+          fi
+
+          gh issue create \
+            --title "Tech Debt Scan: $(date +%Y-%m-%d)" \
+            --body-file "$BODY_FILE" \
+            --label "tech-debt,automated"
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+
+          echo "### Tech Debt Scanner" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Model:** ${{ inputs.ai_model }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Categories:** ${{ inputs.categories }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Max items per category:** ${{ inputs.max_items_per_category }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **JSON valid:** ${{ steps.parse.outputs.json_valid }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.parse.outputs.json_valid }}" = "true" ]; then
+            echo "See the created GitHub Issue for the full report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f "${{ steps.context.outputs.context_file }}" \
+                "${{ steps.prompt.outputs.prompt_file }}" \
+                "${{ steps.claude.outputs.response_file }}" \
+                "${{ steps.parse.outputs.json_file }}" 2>/dev/null || true

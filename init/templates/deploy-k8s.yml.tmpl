@@ -1,0 +1,13 @@
+name: Deploy K8s
+on:
+  push:
+    branches: [{{BASE_BRANCH}}]
+  workflow_dispatch:
+jobs:
+  deploy:
+    uses: SevFle/devops-toolkit/.github/workflows/deploy-k8s.yml@main
+    with:
+      image_name: ghcr.io/${{ github.repository }}
+      deployment_name: {{APP_NAME}}
+      namespace: {{NAMESPACE}}
+    secrets: inherit

@@ -1,0 +1,347 @@
+name: 'Test Report & Coverage'
+description: 'Parse test results and coverage reports, post PR comment with summary'
+
+inputs:
+  test_results_path:
+    description: 'Path to test results file (JUnit XML or pytest JSON)'
+    required: false
+    default: ''
+  coverage_path:
+    description: 'Path to coverage report file (lcov, coverage.json, or cobertura XML)'
+    required: false
+    default: ''
+  coverage_format:
+    description: 'Coverage format: auto, lcov, json, cobertura'
+    required: false
+    default: 'auto'
+  base_branch:
+    description: 'Base branch for coverage delta comparison'
+    required: false
+    default: 'main'
+  post_comment:
+    description: 'Whether to post a PR comment with results'
+    required: false
+    default: 'true'
+
+outputs:
+  total_tests:
+    description: 'Total number of tests'
+    value: ${{ steps.parse-tests.outputs.total_tests }}
+  passed:
+    description: 'Number of passed tests'
+    value: ${{ steps.parse-tests.outputs.passed }}
+  failed:
+    description: 'Number of failed tests'
+    value: ${{ steps.parse-tests.outputs.failed }}
+  coverage_pct:
+    description: 'Line coverage percentage'
+    value: ${{ steps.parse-coverage.outputs.coverage_pct }}
+  coverage_delta:
+    description: 'Coverage delta vs base branch'
+    value: ${{ steps.parse-coverage.outputs.coverage_delta }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Parse test results
+      id: parse-tests
+      if: inputs.test_results_path != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        FILE="${{ inputs.test_results_path }}"
+
+        if [ ! -f "$FILE" ]; then
+          echo "::warning::Test results file not found: $FILE"
+          echo "total_tests=0" >> "$GITHUB_OUTPUT"
+          echo "passed=0" >> "$GITHUB_OUTPUT"
+          echo "failed=0" >> "$GITHUB_OUTPUT"
+          echo "skipped=0" >> "$GITHUB_OUTPUT"
+          echo "duration=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Detect format and parse
+        if head -5 "$FILE" | grep -q '<?xml\|<testsuites\|<testsuite'; then
+          # JUnit XML
+          python3 -c "
+        import xml.etree.ElementTree as ET, sys
+        tree = ET.parse('$FILE')
+        root = tree.getroot()
+        if root.tag == 'testsuites':
+            suites = root.findall('testsuite')
+        else:
+            suites = [root]
+        total = passed = failed = skipped = 0
+        duration = 0.0
+        for s in suites:
+            t = int(s.get('tests', 0))
+            f = int(s.get('failures', 0))
+            e = int(s.get('errors', 0))
+            sk = int(s.get('skipped', 0))
+            d = float(s.get('time', 0))
+            total += t
+            failed += f + e
+            skipped += sk
+            duration += d
+        passed = total - failed - skipped
+        print(f'total_tests={total}')
+        print(f'passed={passed}')
+        print(f'failed={failed}')
+        print(f'skipped={skipped}')
+        print(f'duration={duration:.2f}')
+        " >> "$GITHUB_OUTPUT"
+        elif head -5 "$FILE" | grep -q '{'; then
+          # pytest JSON
+          python3 -c "
+        import json, sys
+        with open('$FILE') as f:
+            data = json.load(f)
+        summary = data.get('summary', {})
+        total = summary.get('total', 0)
+        passed = summary.get('passed', 0)
+        failed = summary.get('failed', 0) + summary.get('error', 0)
+        skipped = summary.get('skipped', 0) + summary.get('deselected', 0)
+        duration = data.get('duration', 0)
+        print(f'total_tests={total}')
+        print(f'passed={passed}')
+        print(f'failed={failed}')
+        print(f'skipped={skipped}')
+        print(f'duration={duration:.2f}')
+        " >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::Unknown test results format"
+          echo "total_tests=0" >> "$GITHUB_OUTPUT"
+          echo "passed=0" >> "$GITHUB_OUTPUT"
+          echo "failed=0" >> "$GITHUB_OUTPUT"
+          echo "skipped=0" >> "$GITHUB_OUTPUT"
+          echo "duration=0" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Parse coverage report
+      id: parse-coverage
+      if: inputs.coverage_path != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        FILE="${{ inputs.coverage_path }}"
+        FORMAT="${{ inputs.coverage_format }}"
+
+        if [ ! -f "$FILE" ]; then
+          echo "::warning::Coverage file not found: $FILE"
+          echo "coverage_pct=0" >> "$GITHUB_OUTPUT"
+          echo "coverage_delta=0" >> "$GITHUB_OUTPUT"
+          echo "per_file_coverage=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Auto-detect format
+        if [ "$FORMAT" = "auto" ]; then
+          if head -5 "$FILE" | grep -q '^TN:\|^SF:'; then
+            FORMAT="lcov"
+          elif head -5 "$FILE" | grep -q '<?xml\|<coverage'; then
+            FORMAT="cobertura"
+          else
+            FORMAT="json"
+          fi
+        fi
+
+        case "$FORMAT" in
+          lcov)
+            python3 -c "
+        import sys
+        total_lines = hit_lines = 0
+        per_file = {}
+        current_file = ''
+        with open('$FILE') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('SF:'):
+                    current_file = line[3:]
+                    per_file[current_file] = {'total': 0, 'hit': 0}
+                elif line.startswith('LF:'):
+                    count = int(line[3:])
+                    total_lines += count
+                    if current_file in per_file:
+                        per_file[current_file]['total'] = count
+                elif line.startswith('LH:'):
+                    count = int(line[3:])
+                    hit_lines += count
+                    if current_file in per_file:
+                        per_file[current_file]['hit'] = count
+        pct = (hit_lines / total_lines * 100) if total_lines > 0 else 0
+        print(f'coverage_pct={pct:.1f}')
+        # Per-file as compact string
+        parts = []
+        for path, data in sorted(per_file.items()):
+            fp = (data['hit'] / data['total'] * 100) if data['total'] > 0 else 0
+            parts.append(f'{path}:{fp:.0f}%')
+        print('per_file_coverage=' + '|'.join(parts[:20]))
+        " >> "$GITHUB_OUTPUT"
+            ;;
+          cobertura)
+            python3 -c "
+        import xml.etree.ElementTree as ET
+        tree = ET.parse('$FILE')
+        root = tree.getroot()
+        rate = float(root.get('line-rate', 0))
+        pct = rate * 100
+        print(f'coverage_pct={pct:.1f}')
+        parts = []
+        for pkg in root.findall('.//package'):
+            for cls in pkg.findall('.//class'):
+                name = cls.get('filename', cls.get('name', ''))
+                r = float(cls.get('line-rate', 0))
+                parts.append(f'{name}:{r*100:.0f}%')
+        print('per_file_coverage=' + '|'.join(parts[:20]))
+        " >> "$GITHUB_OUTPUT"
+            ;;
+          json)
+            python3 -c "
+        import json
+        with open('$FILE') as f:
+            data = json.load(f)
+        # Support coverage.py JSON and istanbul JSON formats
+        if 'totals' in data:
+            pct = data['totals'].get('percent_covered', 0)
+        elif 'total' in data:
+            summary = data['total']
+            lines = summary.get('lines', {})
+            pct = lines.get('pct', 0)
+        else:
+            pct = 0
+        print(f'coverage_pct={pct:.1f}')
+        parts = []
+        files = data.get('files', data.get('coverage', {}))
+        if isinstance(files, dict):
+            for path, info in sorted(list(files.items())[:20]):
+                if isinstance(info, dict):
+                    fp = info.get('summary', info).get('percent_covered', info.get('pct', 0))
+                    parts.append(f'{path}:{fp:.0f}%')
+        print('per_file_coverage=' + '|'.join(parts))
+        " >> "$GITHUB_OUTPUT"
+            ;;
+        esac
+
+        # Compute coverage delta from previous comment
+        echo "coverage_delta=0" >> "$GITHUB_OUTPUT"
+
+    - name: Compute coverage delta
+      id: coverage-delta
+      if: inputs.coverage_path != '' && inputs.post_comment == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        CURRENT_PCT="${{ steps.parse-coverage.outputs.coverage_pct }}"
+
+        if [ -z "$CURRENT_PCT" ] || [ "$CURRENT_PCT" = "0" ]; then
+          echo "coverage_delta=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Try to find previous coverage from PR comments
+        PREV_PCT=""
+        if [ -n "${GITHUB_EVENT_PATH:-}" ]; then
+          PR_NUMBER=$(python3 -c "
+        import json, os
+        try:
+            with open(os.environ['GITHUB_EVENT_PATH']) as f:
+                data = json.load(f)
+            print(data.get('pull_request', {}).get('number', data.get('number', '')))
+        except Exception:
+            print('')
+        " 2>/dev/null || true)
+
+          if [ -n "$PR_NUMBER" ]; then
+            PREV_PCT=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              --jq '[.[] | select(.body | contains("Coverage")) | .body] | last // empty' 2>/dev/null \
+              | grep -oP 'Coverage.*?\|\s*\K[\d.]+(?=%)' 2>/dev/null | head -1 || true)
+          fi
+        fi
+
+        if [ -n "$PREV_PCT" ]; then
+          DELTA=$(python3 -c "print(f'{float(\"$CURRENT_PCT\") - float(\"$PREV_PCT\"):+.1f}')")
+        else
+          DELTA="+0.0"
+        fi
+        echo "coverage_delta=${DELTA}" >> "$GITHUB_OUTPUT"
+
+    - name: Post PR comment
+      if: inputs.post_comment == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+
+        TOTAL="${{ steps.parse-tests.outputs.total_tests }}"
+        PASSED="${{ steps.parse-tests.outputs.passed }}"
+        FAILED="${{ steps.parse-tests.outputs.failed }}"
+        SKIPPED="${{ steps.parse-tests.outputs.skipped }}"
+        DURATION="${{ steps.parse-tests.outputs.duration }}"
+        COV_PCT="${{ steps.parse-coverage.outputs.coverage_pct }}"
+        COV_DELTA="${{ steps.coverage-delta.outputs.coverage_delta }}"
+        PER_FILE="${{ steps.parse-coverage.outputs.per_file_coverage }}"
+
+        # Build comment body
+        BODY="## Test Report\n\n"
+
+        # Test results table
+        if [ -n "$TOTAL" ] && [ "$TOTAL" != "0" ]; then
+          STATUS_ICON="white_check_mark"
+          [ "${FAILED:-0}" != "0" ] && STATUS_ICON="x"
+          BODY+="### :test_tube: Test Results\n\n"
+          BODY+="| Metric | Value |\n"
+          BODY+="|--------|-------|\n"
+          BODY+="| Total | ${TOTAL} |\n"
+          BODY+="| :${STATUS_ICON}: Passed | ${PASSED} |\n"
+          BODY+="| :x: Failed | ${FAILED:-0} |\n"
+          BODY+="| :fast_forward: Skipped | ${SKIPPED:-0} |\n"
+          BODY+="| :stopwatch: Duration | ${DURATION}s |\n\n"
+        fi
+
+        # Coverage summary
+        if [ -n "$COV_PCT" ] && [ "$COV_PCT" != "0" ]; then
+          BODY+="### :bar_chart: Coverage\n\n"
+          BODY+="| Metric | Value |\n"
+          BODY+="|--------|-------|\n"
+          BODY+="| Coverage | ${COV_PCT}% |\n"
+          BODY+="| Delta | ${COV_DELTA:-+0.0}% |\n\n"
+
+          # Per-file coverage for changed files
+          if [ -n "$PER_FILE" ]; then
+            # Get changed files in this PR
+            CHANGED_FILES=$(git diff --name-only "origin/${{ inputs.base_branch }}...HEAD" 2>/dev/null || true)
+            if [ -n "$CHANGED_FILES" ]; then
+              BODY+="<details>\n<summary>Per-file coverage (changed files)</summary>\n\n"
+              BODY+="| File | Coverage |\n"
+              BODY+="|------|----------|\n"
+              IFS='|' read -ra FILE_ENTRIES <<< "$PER_FILE"
+              for entry in "${FILE_ENTRIES[@]}"; do
+                FPATH="${entry%%:*}"
+                FPCT="${entry#*:}"
+                # Check if this file was changed
+                if echo "$CHANGED_FILES" | grep -qF "$(basename "$FPATH")"; then
+                  BODY+="| \`${FPATH}\` | ${FPCT} |\n"
+                fi
+              done
+              BODY+="</details>\n"
+            fi
+          fi
+        fi
+
+        BODY+="\n---\n*Generated by devops-toolkit test-report*"
+
+        # Find and update existing comment or create new one
+        PR_NUMBER="${{ github.event.pull_request.number }}"
+        COMMENT_ID=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+          --jq '[.[] | select(.body | contains("## Test Report")) | .id] | last // empty' 2>/dev/null || true)
+
+        if [ -n "$COMMENT_ID" ]; then
+          gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" \
+            -X PATCH -f body="$(echo -e "$BODY")"
+        else
+          gh pr comment "$PR_NUMBER" --body "$(echo -e "$BODY")"
+        fi

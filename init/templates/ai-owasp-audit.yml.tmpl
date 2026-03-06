@@ -1,0 +1,10 @@
+name: OWASP Audit
+on:
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+  pull_request:
+jobs:
+  audit:
+    uses: SevFle/devops-toolkit/.github/workflows/ai-owasp-audit.yml@main
+    secrets: inherit

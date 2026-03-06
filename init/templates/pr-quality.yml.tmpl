@@ -1,0 +1,8 @@
+name: PR Quality
+on:
+  pull_request:
+    types: [opened, synchronize, edited]
+jobs:
+  quality:
+    uses: SevFle/devops-toolkit/.github/workflows/pr-quality.yml@main
+    secrets: inherit

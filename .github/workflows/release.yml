@@ -31,11 +31,17 @@ on:
       publish_npm:
         type: boolean
         default: false
+      generate_notes:
+        type: boolean
+        default: false
+        description: 'Generate AI-powered release notes using Claude'
       runners:
         type: string
         default: 'self-hosted'
     secrets:
       NPM_TOKEN:
+        required: false
+      ANTHROPIC_API_KEY:
         required: false
 
 permissions:
@@ -85,11 +91,65 @@ jobs:
           git push origin HEAD
           git push origin v${{ steps.bump.outputs.version }}
 
+      - name: Generate AI release notes
+        if: inputs.generate_notes
+        id: ai-notes
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || git rev-list --max-parents=0 HEAD)
+
+          PROMPT_FILE=$(mktemp /tmp/release-notes-prompt-XXXXXX.md)
+          cat .devops-toolkit/prompts/release-notes.prompt.md > "$PROMPT_FILE"
+
+          echo "" >> "$PROMPT_FILE"
+          echo "---" >> "$PROMPT_FILE"
+          echo "## Configuration" >> "$PROMPT_FILE"
+          echo "- include_internal: false" >> "$PROMPT_FILE"
+          echo "" >> "$PROMPT_FILE"
+          echo "## Git Log ($PREV_TAG..HEAD)" >> "$PROMPT_FILE"
+          echo '```' >> "$PROMPT_FILE"
+          git log --oneline "$PREV_TAG..HEAD" >> "$PROMPT_FILE"
+          echo '```' >> "$PROMPT_FILE"
+          echo "" >> "$PROMPT_FILE"
+          echo "## Diff Stats" >> "$PROMPT_FILE"
+          echo '```' >> "$PROMPT_FILE"
+          git diff --stat "$PREV_TAG..HEAD" >> "$PROMPT_FILE" 2>/dev/null || true
+          echo '```' >> "$PROMPT_FILE"
+          echo "" >> "$PROMPT_FILE"
+          echo "## Merged Pull Requests" >> "$PROMPT_FILE"
+          echo '```' >> "$PROMPT_FILE"
+          gh pr list --state merged --base main --json number,title,author,labels --limit 100 2>/dev/null >> "$PROMPT_FILE" || true
+          echo '```' >> "$PROMPT_FILE"
+
+          RESPONSE_FILE=$(mktemp /tmp/release-notes-response-XXXXXX.txt)
+          cat "$PROMPT_FILE" | claude -p \
+            --model "claude-sonnet-4-5-20250514" \
+            --max-turns 1 \
+            --allowedTools "" \
+            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+
+          NOTES_FILE=$(mktemp /tmp/release-notes-final-XXXXXX.md)
+          sed '/^```markdown$/d; /^```$/d' "$RESPONSE_FILE" > "$NOTES_FILE"
+
+          EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
+          {
+            echo "body<<${EOF_MARKER}"
+            cat "$NOTES_FILE"
+            echo "${EOF_MARKER}"
+          } >> "$GITHUB_OUTPUT"
+
+          rm -f "$PROMPT_FILE" "$RESPONSE_FILE" "$NOTES_FILE" 2>/dev/null || true
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.bump.outputs.version }}
           name: Release v${{ steps.bump.outputs.version }}
+          body: ${{ steps.ai-notes.outputs.body || '' }}
           draft: false
           prerelease: ${{ inputs.pre_release }}
         env:

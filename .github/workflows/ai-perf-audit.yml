@@ -1,0 +1,256 @@
+name: AI Performance Audit
+
+on:
+  workflow_call:
+    inputs:
+      ai_model:
+        type: string
+        default: 'claude-sonnet-4-5-20250514'
+        description: 'Claude model for audit'
+      focus_areas:
+        type: string
+        default: 'all'
+        description: 'Focus areas (all or comma-separated: database, memory, io, frontend, algorithmic)'
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  perf-audit:
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Checkout devops-toolkit for prompts
+        uses: actions/checkout@v6
+        with:
+          repository: SevFle/devops-toolkit
+          path: .devops-toolkit
+          ref: main
+
+      - name: Prepare prompt
+        env:
+          FOCUS_AREAS: ${{ inputs.focus_areas }}
+        run: |
+          set -euo pipefail
+
+          PROMPT_SRC=".devops-toolkit/prompts/perf-audit.prompt.md"
+          if [ ! -f "$PROMPT_SRC" ]; then
+            echo "::error::Prompt file not found: $PROMPT_SRC"
+            exit 1
+          fi
+
+          # Substitute focus areas using env var (safe from injection)
+          sed "s|{{FOCUS_AREAS}}|${FOCUS_AREAS}|g" \
+            "$PROMPT_SRC" > /tmp/perf-prompt.md
+
+          # Append file listing with sizes
+          {
+            printf '\n---\n\n## Repository File Listing (with sizes)\n\n```\n'
+            find . -type f \
+              -not -path './.git/*' \
+              -not -path './.devops-toolkit/*' \
+              -not -path './node_modules/*' \
+              -not -path './vendor/*' \
+              -not -path './.venv/*' \
+              -not -name '*.lock' \
+              -not -name 'package-lock.json' \
+              -exec ls -lh {} \; 2>/dev/null | awk '{print $5, $NF}' | sort -k2
+            printf '```\n\n'
+          } >> /tmp/perf-prompt.md
+
+          # Append source files
+          {
+            printf '## Source Files\n\n'
+            TOTAL_SIZE=0
+            MAX_SIZE=200000
+            find . -type f \
+              \( -name '*.ts' -o -name '*.js' -o -name '*.py' -o -name '*.go' \
+                 -o -name '*.rb' -o -name '*.java' -o -name '*.rs' -o -name '*.php' \
+                 -o -name '*.sql' -o -name '*.graphql' \) \
+              -not -path './.git/*' \
+              -not -path './.devops-toolkit/*' \
+              -not -path './node_modules/*' \
+              -not -path './vendor/*' \
+              -not -path './.venv/*' \
+              -not -name '*.test.*' \
+              -not -name '*.spec.*' \
+              -not -name '*_test.*' | sort | while read -r f; do
+              FILE_SIZE=$(wc -c < "$f" 2>/dev/null || echo 0)
+              TOTAL_SIZE=$((TOTAL_SIZE + FILE_SIZE))
+              if [ "$TOTAL_SIZE" -gt "$MAX_SIZE" ]; then
+                break
+              fi
+              printf '### %s\n\n```\n' "$f"
+              head -c 50000 "$f"
+              printf '\n```\n\n'
+            done
+          } >> /tmp/perf-prompt.md
+
+      - name: Run Claude Performance Audit
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_MODEL: ${{ inputs.ai_model }}
+        run: |
+          set -euo pipefail
+          RESPONSE_FILE=$(mktemp)
+
+          cat /tmp/perf-prompt.md | claude -p \
+            --model "$AI_MODEL" \
+            --max-turns 1 \
+            --allowedTools "" \
+            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+
+          # Extract JSON block
+          JSON_FILE=$(mktemp)
+          if sed -n '/^```json/,/^```$/p' "$RESPONSE_FILE" | sed '1d;$d' > "$JSON_FILE" 2>/dev/null; then
+            if python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$JSON_FILE" 2>/dev/null; then
+              echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+              echo "parse_ok=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::Claude response did not contain valid JSON"
+              echo "parse_ok=false" >> "$GITHUB_OUTPUT"
+              echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::warning::No JSON block found in Claude response"
+            echo "parse_ok=false" >> "$GITHUB_OUTPUT"
+            echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "response_file=$RESPONSE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Issue with findings
+        if: steps.claude.outputs.parse_ok == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JSON_FILE: ${{ steps.claude.outputs.json_file }}
+        run: |
+          set -euo pipefail
+
+          ISSUE_BODY=$(python3 -c "
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          findings = data.get('findings', [])
+
+          if not findings:
+              print('No performance issues detected. The codebase looks efficient!')
+              sys.exit(0)
+
+          # Sort by estimated_impact
+          impact_order = {'high': 0, 'medium': 1, 'low': 2}
+          findings.sort(key=lambda f: impact_order.get(f.get('estimated_impact','low').split(' ')[0].split('-')[0].strip(), 2))
+
+          icons = {'database': 'DB', 'memory': 'MEM', 'io': 'I/O', 'frontend': 'FE', 'algorithmic': 'ALG'}
+          severity_icons = {'critical': '🔴', 'high': '🟠', 'medium': '🟡', 'low': '🔵'}
+
+          lines = ['# Performance Audit Results\n']
+
+          # Summary table
+          lines.append('## Summary\n')
+          lines.append('| Category | Count |')
+          lines.append('|----------|-------|')
+          cats = {}
+          for f in findings:
+              c = f.get('category','unknown')
+              cats[c] = cats.get(c, 0) + 1
+          for c in ['database','memory','io','frontend','algorithmic']:
+              if c in cats:
+                  lines.append('| %s (%s) | %d |' % (c.title(), icons.get(c,''), cats[c]))
+          lines.append('')
+
+          # Impact sections
+          for impact_level in ['high', 'medium', 'low']:
+              section_findings = [f for f in findings if f.get('estimated_impact','').startswith(impact_level)]
+              if not section_findings:
+                  continue
+              lines.append('## %s Impact\n' % impact_level.upper())
+              for f in section_findings:
+                  sev = f.get('severity','medium')
+                  lines.append('### %s [%s] %s' % (severity_icons.get(sev,''), sev.upper(), f.get('category','').title()))
+                  lines.append('**File:** \`%s:%s\`' % (f.get('file','?'), f.get('line','?')))
+                  lines.append('**Impact:** %s\n' % f.get('estimated_impact',''))
+                  lines.append(f.get('description',''))
+                  lines.append('\n**Suggestion:**')
+                  lines.append(f.get('suggestion',''))
+                  lines.append('\n---\n')
+
+          print('\n'.join(lines))
+          " "$JSON_FILE")
+
+          if [ -n "$ISSUE_BODY" ]; then
+            TITLE="Performance Audit - $(date +%Y-%m-%d)"
+            gh issue create \
+              --title "$TITLE" \
+              --body "$ISSUE_BODY" \
+              --label "performance,audit" 2>/dev/null || \
+            gh issue create \
+              --title "$TITLE" \
+              --body "$ISSUE_BODY" || echo "::warning::Failed to create issue"
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          JSON_FILE: ${{ steps.claude.outputs.json_file }}
+          PARSE_OK: ${{ steps.claude.outputs.parse_ok }}
+          RESPONSE_FILE: ${{ steps.claude.outputs.response_file }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Performance Audit Results"
+            echo ""
+            if [ "${PARSE_OK:-false}" = "true" ]; then
+              python3 -c "
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          findings = data.get('findings', [])
+          if not findings:
+              print('No performance issues detected.')
+              sys.exit(0)
+
+          # Count by impact
+          impacts = {}
+          for f in findings:
+              i = f.get('estimated_impact','low').split(' ')[0].split('-')[0].strip()
+              impacts[i] = impacts.get(i, 0) + 1
+
+          print('| Impact | Count |')
+          print('|--------|-------|')
+          for i in ['high','medium','low']:
+              if i in impacts:
+                  print('| %s | %d |' % (i.upper(), impacts[i]))
+          print()
+          print('### Top Findings')
+          print()
+          for f in findings[:10]:
+              print('- **[%s]** %s in \`%s:%s\` - %s' % (
+                  f.get('severity','').upper(),
+                  f.get('category',''),
+                  f.get('file','?'),
+                  f.get('line','?'),
+                  f.get('description','')[:100]
+              ))
+          " "$JSON_FILE" || echo "Failed to parse findings"
+            else
+              echo "Failed to parse Claude response as JSON."
+              echo ""
+              echo "<details><summary>Raw response</summary>"
+              echo ""
+              echo '```'
+              head -c 5000 "${RESPONSE_FILE:-/dev/null}" 2>/dev/null || echo "(no response)"
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

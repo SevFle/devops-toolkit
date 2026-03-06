@@ -1,0 +1,165 @@
+name: Housekeeping
+
+on:
+  workflow_call:
+    inputs:
+      stale_days:
+        type: number
+        default: 30
+        description: 'Days of inactivity before considering stale'
+      close_stale:
+        type: boolean
+        default: false
+        description: 'Close stale issues (not just label them)'
+      close_abandoned_drafts:
+        type: boolean
+        default: true
+        description: 'Close abandoned draft PRs on openspec/* branches'
+      delete_merged_branches:
+        type: boolean
+        default: true
+        description: 'Delete branches that have been merged'
+      protected_branches:
+        type: string
+        default: 'main,develop'
+        description: 'Comma-separated list of branches to never delete'
+      dry_run:
+        type: boolean
+        default: false
+        description: 'Report what would be done without making changes'
+      runners:
+        type: string
+        default: 'self-hosted'
+        description: 'Runner label(s), JSON array or string'
+
+jobs:
+  housekeeping:
+    name: Housekeeping
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Stale issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STALE_DAYS: ${{ inputs.stale_days }}
+          CLOSE_STALE: ${{ inputs.close_stale }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          echo "## Stale Issues" >> "$GITHUB_STEP_SUMMARY"
+
+          CUTOFF_DATE=$(date -u -d "-${STALE_DAYS} days" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+            date -u -v-${STALE_DAYS}d +%Y-%m-%dT%H:%M:%SZ)
+
+          STALE_ISSUES=$(gh issue list --state open --json number,title,updatedAt --jq \
+            ".[] | select(.updatedAt < \"${CUTOFF_DATE}\") | \"\(.number)\t\(.title)\"" || true)
+
+          if [ -z "$STALE_ISSUES" ]; then
+            echo "No stale issues found." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Issue | Title | Action |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|-------|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
+
+            while IFS=$'\t' read -r ISSUE_NUM ISSUE_TITLE; do
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "| #${ISSUE_NUM} | ${ISSUE_TITLE} | Would label/close |" >> "$GITHUB_STEP_SUMMARY"
+              else
+                gh issue edit "$ISSUE_NUM" --add-label "stale"
+                if [ "$CLOSE_STALE" = "true" ]; then
+                  gh issue close "$ISSUE_NUM" --comment "Closed by housekeeping: no activity for ${STALE_DAYS}+ days."
+                  echo "| #${ISSUE_NUM} | ${ISSUE_TITLE} | Closed |" >> "$GITHUB_STEP_SUMMARY"
+                else
+                  echo "| #${ISSUE_NUM} | ${ISSUE_TITLE} | Labeled stale |" >> "$GITHUB_STEP_SUMMARY"
+                fi
+              fi
+            done <<< "$STALE_ISSUES"
+          fi
+
+      - name: Abandoned draft PRs
+        if: inputs.close_abandoned_drafts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STALE_DAYS: ${{ inputs.stale_days }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          echo "## Abandoned Draft PRs" >> "$GITHUB_STEP_SUMMARY"
+
+          CUTOFF_DATE=$(date -u -d "-${STALE_DAYS} days" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
+            date -u -v-${STALE_DAYS}d +%Y-%m-%dT%H:%M:%SZ)
+
+          DRAFT_PRS=$(gh pr list --state open --draft --json number,title,updatedAt,headRefName --jq \
+            ".[] | select(.updatedAt < \"${CUTOFF_DATE}\" and (.headRefName | startswith(\"openspec/\"))) | \"\(.number)\t\(.title)\"" || true)
+
+          if [ -z "$DRAFT_PRS" ]; then
+            echo "No abandoned draft PRs found." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| PR | Title | Action |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|----|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
+
+            while IFS=$'\t' read -r PR_NUM PR_TITLE; do
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "| #${PR_NUM} | ${PR_TITLE} | Would close |" >> "$GITHUB_STEP_SUMMARY"
+              else
+                gh pr close "$PR_NUM" --comment "Closed by housekeeping: abandoned draft with no activity for ${STALE_DAYS}+ days."
+                echo "| #${PR_NUM} | ${PR_TITLE} | Closed |" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done <<< "$DRAFT_PRS"
+          fi
+
+      - name: Merged branches
+        if: inputs.delete_merged_branches
+        env:
+          PROTECTED: ${{ inputs.protected_branches }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          echo "## Merged Branches" >> "$GITHUB_STEP_SUMMARY"
+
+          git fetch --prune
+
+          # Build grep pattern for protected branches
+          PROTECT_PATTERN=$(echo "$PROTECTED" | tr ',' '|')
+          PROTECT_PATTERN="(${PROTECT_PATTERN}|HEAD)"
+
+          MERGED_BRANCHES=$(git branch -r --merged origin/main | \
+            sed 's/origin\///' | \
+            sed 's/^[[:space:]]*//' | \
+            grep -Ev "$PROTECT_PATTERN" || true)
+
+          if [ -z "$MERGED_BRANCHES" ]; then
+            echo "No merged branches to clean up." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Branch | Action |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|--------|--------|" >> "$GITHUB_STEP_SUMMARY"
+
+            while IFS= read -r BRANCH; do
+              BRANCH=$(echo "$BRANCH" | xargs)
+              if [ -z "$BRANCH" ]; then
+                continue
+              fi
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "| ${BRANCH} | Would delete |" >> "$GITHUB_STEP_SUMMARY"
+              else
+                git push origin --delete "$BRANCH" 2>/dev/null || true
+                echo "| ${BRANCH} | Deleted |" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done <<< "$MERGED_BRANCHES"
+          fi
+
+      - name: Summary
+        run: |
+          set -euo pipefail
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "> **Dry run mode**: No changes were made." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "> Housekeeping completed." >> "$GITHUB_STEP_SUMMARY"
+          fi

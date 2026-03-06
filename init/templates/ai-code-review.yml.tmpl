@@ -1,0 +1,8 @@
+name: AI Code Review
+on:
+  pull_request:
+    types: [opened, synchronize]
+jobs:
+  review:
+    uses: SevFle/devops-toolkit/.github/workflows/ai-code-review.yml@main
+    secrets: inherit

@@ -59,6 +59,10 @@ on:
         type: string
         default: 'npx playwright test'
         description: 'E2E test command'
+      test_report:
+        type: boolean
+        default: false
+        description: 'Enable test report and coverage publishing'
       runners:
         type: string
         default: 'self-hosted'
@@ -167,6 +171,19 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  test-report:
+    name: Test Report
+    if: inputs.test_report
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./actions/test-report
+        with:
+          test_results_path: ${{ inputs.working_directory }}/test-results.xml
+          coverage_path: ${{ inputs.working_directory }}/coverage/lcov.info
+          base_branch: 'main'
 
   ci-status:
     name: CI Status

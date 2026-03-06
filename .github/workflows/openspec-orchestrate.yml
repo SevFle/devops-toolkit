@@ -1,0 +1,100 @@
+name: Orchestrate OpenSpec Change
+
+on:
+  workflow_call:
+    inputs:
+      change_name:
+        type: string
+        required: true
+        description: 'OpenSpec change name to implement'
+      max_attempts:
+        type: number
+        default: 5
+        description: 'Max implementation attempts'
+      max_review_cycles:
+        type: number
+        default: 3
+        description: 'Max review cycles'
+      skip_review:
+        type: boolean
+        default: false
+        description: 'Skip Claude code review phase'
+      base_branch:
+        type: string
+        default: 'develop'
+        description: 'Base branch for feature branch'
+      timeout_minutes:
+        type: number
+        default: 120
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      OPENSPEC_GH_TOKEN:
+        required: true
+      ANTHROPIC_API_KEY:
+        required: true
+
+jobs:
+  orchestrate:
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Checkout devops-toolkit
+        uses: actions/checkout@v6
+        with:
+          repository: SevFle/devops-toolkit
+          path: .devops-toolkit
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "devops-toolkit[bot]"
+          git config --global user.email "devops-toolkit[bot]@users.noreply.github.com"
+
+      - name: Validate tools
+        run: |
+          echo "Checking required tools..."
+          command -v python3 || { echo "ERROR: python3 not found"; exit 1; }
+          command -v claude || { echo "ERROR: claude not found"; exit 1; }
+          command -v gh || { echo "ERROR: gh not found"; exit 1; }
+          command -v git || { echo "ERROR: git not found"; exit 1; }
+          echo "All tools available."
+
+      - name: Run orchestrator
+        env:
+          GITHUB_TOKEN: ${{ secrets.OPENSPEC_GH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ORCHESTRATOR_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+          ORCHESTRATOR_MAX_REVIEW_CYCLES: ${{ inputs.max_review_cycles }}
+          CHANGE_NAME: ${{ inputs.change_name }}
+          SKIP_REVIEW: ${{ inputs.skip_review }}
+          PYTHONPATH: .devops-toolkit/orchestrator
+        run: |
+          SKIP_FLAG=""
+          if [ "$SKIP_REVIEW" = "true" ]; then
+            SKIP_FLAG="--skip-review"
+          fi
+
+          python3 .devops-toolkit/orchestrator/orchestrate.py \
+            "$CHANGE_NAME" \
+            --no-clone \
+            --base-branch "${{ inputs.base_branch }}" \
+            $SKIP_FLAG
+
+      - name: Write job summary
+        if: always()
+        env:
+          CHANGE_NAME: ${{ inputs.change_name }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          echo "## Orchestration Result" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Change:** $CHANGE_NAME" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Status:** $JOB_STATUS" >> "$GITHUB_STEP_SUMMARY"

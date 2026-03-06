@@ -1,0 +1,280 @@
+name: Test Gap Analysis & Generation
+
+on:
+  workflow_call:
+    inputs:
+      ai_model:
+        type: string
+        default: 'claude-sonnet-4-5-20250514'
+        description: 'Claude model for test generation'
+      max_tests:
+        type: number
+        default: 10
+        description: 'Maximum number of test files to generate'
+      test_framework:
+        type: string
+        default: 'auto'
+        description: 'Test framework (auto, jest, pytest, go, vitest)'
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  test-gaps:
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Checkout devops-toolkit for prompts
+        uses: actions/checkout@v6
+        with:
+          repository: SevFle/devops-toolkit
+          path: .devops-toolkit
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "ai-test-gen[bot]"
+          git config --global user.email "ai-test-gen[bot]@users.noreply.github.com"
+
+      - name: Detect test framework and run coverage
+        id: coverage
+        env:
+          TEST_FRAMEWORK: ${{ inputs.test_framework }}
+        run: |
+          set -euo pipefail
+          COVERAGE_FILE=$(mktemp)
+          FRAMEWORK="unknown"
+
+          if [ "$TEST_FRAMEWORK" != "auto" ]; then
+            FRAMEWORK="$TEST_FRAMEWORK"
+          else
+            # Auto-detect framework
+            if [ -f "jest.config.js" ] || [ -f "jest.config.ts" ] || grep -q '"jest"' package.json 2>/dev/null; then
+              FRAMEWORK="jest"
+            elif [ -f "vitest.config.ts" ] || [ -f "vitest.config.js" ]; then
+              FRAMEWORK="vitest"
+            elif [ -f "pytest.ini" ] || [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+              FRAMEWORK="pytest"
+            elif [ -f "go.mod" ]; then
+              FRAMEWORK="go"
+            fi
+          fi
+
+          echo "framework=$FRAMEWORK" >> "$GITHUB_OUTPUT"
+
+          # Run coverage based on framework
+          case "$FRAMEWORK" in
+            jest)
+              npx jest --coverage --coverageReporters=text --no-colors 2>&1 | tee "$COVERAGE_FILE" || true
+              ;;
+            vitest)
+              npx vitest run --coverage --reporter=text 2>&1 | tee "$COVERAGE_FILE" || true
+              ;;
+            pytest)
+              python3 -m pytest --cov --cov-report=term-missing --no-header -q 2>&1 | tee "$COVERAGE_FILE" || true
+              ;;
+            go)
+              go test ./... -coverprofile=coverage.out 2>&1 | tee "$COVERAGE_FILE" || true
+              if [ -f coverage.out ]; then
+                go tool cover -func=coverage.out >> "$COVERAGE_FILE" 2>&1 || true
+              fi
+              ;;
+            *)
+              echo "Could not detect test framework. Proceeding with static analysis only." > "$COVERAGE_FILE"
+              ;;
+          esac
+
+          # Truncate if too large
+          if [ "$(wc -c < "$COVERAGE_FILE")" -gt 50000 ]; then
+            head -c 50000 "$COVERAGE_FILE" > "${COVERAGE_FILE}.trunc"
+            mv "${COVERAGE_FILE}.trunc" "$COVERAGE_FILE"
+          fi
+
+          echo "coverage_file=$COVERAGE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare prompt
+        env:
+          COVERAGE_FILE: ${{ steps.coverage.outputs.coverage_file }}
+          FRAMEWORK: ${{ steps.coverage.outputs.framework }}
+          MAX_TESTS: ${{ inputs.max_tests }}
+        run: |
+          set -euo pipefail
+
+          PROMPT_SRC=".devops-toolkit/prompts/test-gap-analysis.prompt.md"
+          if [ ! -f "$PROMPT_SRC" ]; then
+            echo "::error::Prompt file not found: $PROMPT_SRC"
+            exit 1
+          fi
+
+          cp "$PROMPT_SRC" /tmp/test-prompt.md
+
+          {
+            printf '\n---\n\n## Configuration\n\n'
+            printf '- **Framework:** %s\n' "$FRAMEWORK"
+            printf '- **Max tests to generate:** %s\n\n' "$MAX_TESTS"
+
+            printf '## Coverage Report\n\n```\n'
+            cat "$COVERAGE_FILE"
+            printf '\n```\n\n'
+
+            printf '## Source Files\n\n'
+
+            # Include source files (skip test files, node_modules, etc.)
+            TOTAL_SIZE=0
+            MAX_SIZE=150000
+            find . -type f \
+              \( -name '*.ts' -o -name '*.js' -o -name '*.py' -o -name '*.go' \
+                 -o -name '*.rb' -o -name '*.java' -o -name '*.rs' \) \
+              -not -path './.git/*' \
+              -not -path './.devops-toolkit/*' \
+              -not -path './node_modules/*' \
+              -not -path './vendor/*' \
+              -not -path './.venv/*' \
+              -not -name '*.test.*' \
+              -not -name '*.spec.*' \
+              -not -name '*_test.*' \
+              -not -path '*/test/*' \
+              -not -path '*/__tests__/*' | sort | while read -r f; do
+              FILE_SIZE=$(wc -c < "$f" 2>/dev/null || echo 0)
+              TOTAL_SIZE=$((TOTAL_SIZE + FILE_SIZE))
+              if [ "$TOTAL_SIZE" -gt "$MAX_SIZE" ]; then
+                break
+              fi
+              printf '### %s\n\n```\n' "$f"
+              head -c 30000 "$f"
+              printf '\n```\n\n'
+            done
+
+            printf '\n## Existing Test Files\n\n'
+            find . -type f \
+              \( -name '*.test.*' -o -name '*.spec.*' -o -name '*_test.*' \) \
+              -not -path './node_modules/*' \
+              -not -path './.devops-toolkit/*' | sort | while read -r f; do
+              printf '### %s\n\n```\n' "$f"
+              head -c 20000 "$f"
+              printf '\n```\n\n'
+            done
+          } >> /tmp/test-prompt.md
+
+      - name: Run Claude Test Generation
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_MODEL: ${{ inputs.ai_model }}
+        run: |
+          set -euo pipefail
+          RESPONSE_FILE=$(mktemp)
+
+          cat /tmp/test-prompt.md | claude -p \
+            --model "$AI_MODEL" \
+            --max-turns 3 \
+            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+
+          echo "response_file=$RESPONSE_FILE" >> "$GITHUB_OUTPUT"
+
+          # Check if any test files were generated
+          NEW_TESTS=$(git status --porcelain | grep -c '^\?' || echo 0)
+          echo "new_test_count=$NEW_TESTS" >> "$GITHUB_OUTPUT"
+
+      - name: Create PR with generated tests
+        if: steps.claude.outputs.new_test_count != '0'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESPONSE_FILE: ${{ steps.claude.outputs.response_file }}
+        run: |
+          set -euo pipefail
+
+          BRANCH="ai/test-gaps-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+
+          # Add only test files
+          git status --porcelain | grep '^\?' | awk '{print $2}' | while read -r f; do
+            if echo "$f" | grep -qE '\.(test|spec|_test)\.'; then
+              git add "$f"
+            fi
+          done
+
+          # Also add modified test files
+          git status --porcelain | grep '^ M' | awk '{print $2}' | while read -r f; do
+            if echo "$f" | grep -qE '\.(test|spec|_test)\.'; then
+              git add "$f"
+            fi
+          done
+
+          if git diff --cached --quiet; then
+            echo "No test files to commit"
+            exit 0
+          fi
+
+          git commit -m "test: add AI-generated tests to fill coverage gaps"
+          git push -u origin "$BRANCH"
+
+          # Extract rationale from response for PR body
+          PR_BODY=$(python3 -c "
+          import sys
+          content = open(sys.argv[1]).read()
+          lines = []
+          lines.append('## AI Test Gap Analysis\n')
+          lines.append('Tests generated automatically to improve coverage.\n')
+
+          # Extract RATIONALE blocks
+          in_rationale = False
+          for line in content.split('\n'):
+              if line.startswith('RATIONALE for'):
+                  in_rationale = True
+                  lines.append('### ' + line)
+              elif line.startswith('SUMMARY:'):
+                  in_rationale = True
+                  lines.append('\n## ' + line)
+              elif in_rationale and line.strip() == '':
+                  in_rationale = False
+                  lines.append('')
+              elif in_rationale:
+                  lines.append(line)
+
+          if len(lines) <= 3:
+              lines.append('See individual test files for details.')
+
+          print('\n'.join(lines))
+          " "$RESPONSE_FILE")
+
+          gh pr create \
+            --title "test: AI-generated tests for coverage gaps" \
+            --body "$PR_BODY" \
+            --head "$BRANCH" || echo "::warning::Failed to create PR"
+
+      - name: Summary
+        if: always()
+        env:
+          RESPONSE_FILE: ${{ steps.claude.outputs.response_file }}
+          NEW_TEST_COUNT: ${{ steps.claude.outputs.new_test_count }}
+          FRAMEWORK: ${{ steps.coverage.outputs.framework }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Test Gap Analysis Results"
+            echo ""
+            echo "- **Framework:** ${FRAMEWORK}"
+            echo "- **New test files:** ${NEW_TEST_COUNT:-0}"
+            echo ""
+            if [ -f "${RESPONSE_FILE:-/dev/null}" ]; then
+              # Extract SUMMARY block
+              SUMMARY=$(sed -n '/^SUMMARY:/,/^$/p' "$RESPONSE_FILE" 2>/dev/null || echo "")
+              if [ -n "$SUMMARY" ]; then
+                echo "$SUMMARY"
+              else
+                echo "Test generation complete. Check the created PR for details."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

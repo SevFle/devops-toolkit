@@ -1,0 +1,232 @@
+name: Kubernetes Deploy
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        type: string
+        required: true
+        description: 'Docker image name (e.g., ghcr.io/owner/repo)'
+      namespace:
+        type: string
+        default: 'default'
+        description: 'Kubernetes namespace'
+      deployment_name:
+        type: string
+        required: true
+        description: 'Kubernetes deployment name'
+      container_name:
+        type: string
+        default: ''
+        description: 'Container name within the deployment (defaults to deployment_name)'
+      registry:
+        type: string
+        default: 'ghcr.io'
+        description: 'Container registry'
+      use_helm:
+        type: boolean
+        default: false
+        description: 'Deploy using Helm'
+      helm_chart:
+        type: string
+        default: ''
+        description: 'Helm chart path or repository'
+      helm_values:
+        type: string
+        default: ''
+        description: 'Helm values file path'
+      kustomize_path:
+        type: string
+        default: ''
+        description: 'Kustomize directory path'
+      rollback_on_failure:
+        type: boolean
+        default: true
+        description: 'Automatically rollback on deployment failure'
+      health_timeout:
+        type: number
+        default: 300
+        description: 'Seconds to wait for deployment health check'
+      runners:
+        type: string
+        default: 'self-hosted'
+        description: 'Runner label(s), JSON array or string'
+    secrets:
+      REGISTRY_USERNAME:
+        required: true
+      REGISTRY_PASSWORD:
+        required: true
+      KUBECONFIG:
+        required: true
+
+jobs:
+  build-push:
+    name: Build & Push Image
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          IMAGE_TAG="${{ inputs.image_name }}:${SHORT_SHA}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_tag }}
+            ${{ inputs.image_name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    needs: build-push
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure kubectl
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBECONFIG }}" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Deploy with Helm
+        if: inputs.use_helm
+        run: |
+          set -euo pipefail
+          HELM_ARGS="--install --namespace ${{ inputs.namespace }} --create-namespace"
+          HELM_ARGS="$HELM_ARGS --set image.repository=${{ inputs.image_name }}"
+          HELM_ARGS="$HELM_ARGS --set image.tag=$(echo '${{ needs.build-push.outputs.image_tag }}' | cut -d: -f2)"
+          HELM_ARGS="$HELM_ARGS --timeout ${{ inputs.health_timeout }}s --wait"
+
+          if [ -n "${{ inputs.helm_values }}" ]; then
+            HELM_ARGS="$HELM_ARGS -f ${{ inputs.helm_values }}"
+          fi
+
+          helm upgrade ${{ inputs.deployment_name }} ${{ inputs.helm_chart }} $HELM_ARGS
+
+      - name: Deploy with Kustomize
+        if: inputs.kustomize_path != '' && !inputs.use_helm
+        run: |
+          set -euo pipefail
+          kubectl apply -k "${{ inputs.kustomize_path }}" --namespace "${{ inputs.namespace }}"
+          kubectl rollout status deployment/"${{ inputs.deployment_name }}" \
+            --namespace "${{ inputs.namespace }}" \
+            --timeout="${{ inputs.health_timeout }}s"
+
+      - name: Deploy with kubectl set image
+        if: inputs.kustomize_path == '' && !inputs.use_helm
+        env:
+          CONTAINER: ${{ inputs.container_name || inputs.deployment_name }}
+        run: |
+          set -euo pipefail
+          kubectl set image deployment/"${{ inputs.deployment_name }}" \
+            "${CONTAINER}=${{ needs.build-push.outputs.image_tag }}" \
+            --namespace "${{ inputs.namespace }}"
+          kubectl rollout status deployment/"${{ inputs.deployment_name }}" \
+            --namespace "${{ inputs.namespace }}" \
+            --timeout="${{ inputs.health_timeout }}s"
+
+      - name: Cleanup kubeconfig
+        if: always()
+        run: rm -f "$HOME/.kube/config"
+
+  verify:
+    name: Verify Deployment
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    needs: deploy
+    permissions:
+      contents: read
+    steps:
+      - name: Configure kubectl
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBECONFIG }}" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Health check
+        run: |
+          set -euo pipefail
+          echo "## Deployment Verification" >> "$GITHUB_STEP_SUMMARY"
+
+          READY=$(kubectl get deployment "${{ inputs.deployment_name }}" \
+            --namespace "${{ inputs.namespace }}" \
+            -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+          DESIRED=$(kubectl get deployment "${{ inputs.deployment_name }}" \
+            --namespace "${{ inputs.namespace }}" \
+            -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Ready Replicas | $READY / $DESIRED |" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$READY" != "$DESIRED" ] || [ "$READY" = "0" ]; then
+            echo "::error::Deployment not healthy: $READY/$DESIRED replicas ready"
+            kubectl describe deployment "${{ inputs.deployment_name }}" --namespace "${{ inputs.namespace }}"
+            exit 1
+          fi
+
+          echo "Deployment verified: $READY/$DESIRED replicas ready"
+
+      - name: Cleanup kubeconfig
+        if: always()
+        run: rm -f "$HOME/.kube/config"
+
+  rollback:
+    name: Rollback
+    if: failure() && inputs.rollback_on_failure && (needs.deploy.result == 'failure' || needs.verify.result == 'failure')
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    needs: [deploy, verify]
+    permissions:
+      contents: read
+    steps:
+      - name: Configure kubectl
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBECONFIG }}" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Rollback deployment
+        run: |
+          set -euo pipefail
+          echo "::warning::Rolling back deployment ${{ inputs.deployment_name }}"
+          kubectl rollout undo deployment/"${{ inputs.deployment_name }}" \
+            --namespace "${{ inputs.namespace }}"
+          kubectl rollout status deployment/"${{ inputs.deployment_name }}" \
+            --namespace "${{ inputs.namespace }}" \
+            --timeout="${{ inputs.health_timeout }}s"
+
+          echo "## Rollback Completed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Deployment ${{ inputs.deployment_name }} rolled back to previous revision." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup kubeconfig
+        if: always()
+        run: rm -f "$HOME/.kube/config"

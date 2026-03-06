@@ -1,0 +1,11 @@
+name: Housekeeping
+on:
+  schedule:
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+jobs:
+  housekeeping:
+    uses: SevFle/devops-toolkit/.github/workflows/housekeeping.yml@main
+    with:
+      dry_run: false
+    secrets: inherit

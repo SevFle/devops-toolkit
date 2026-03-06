@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from lib.complexity import score_complexity, timeout_for_attempt
 from lib.config import Config
 from lib.git_ops import (
     GitError,
@@ -215,6 +216,16 @@ def setup_phase(
     if not validate_change(args.change_name, work_dir, logger):
         raise SystemExit(f"OpenSpec change '{args.change_name}' not found or invalid")
 
+    # Score complexity and adapt budget if enabled
+    complexity = score_complexity(args.change_name, work_dir)
+    logger.info(
+        "Complexity scored",
+        level=complexity.level,
+        raw_score=complexity.raw_score,
+        task_count=complexity.task_count,
+        keyword_score=complexity.keyword_score,
+    )
+
     # Create branch
     branch_name = f"openspec/{args.change_name}"
     try:
@@ -349,7 +360,13 @@ def implementation_phase(
     for attempt in range(1, config.max_implementation_attempts + 1):
         _check_time_budget(start_time, config, logger, "implementation")
         total_attempts = attempt
-        logger.info(f"Implementation attempt {attempt}/{config.max_implementation_attempts}")
+        attempt_timeout = timeout_for_attempt(
+            config.claude_timeout, attempt, config.max_implementation_attempts,
+        )
+        logger.info(
+            f"Implementation attempt {attempt}/{config.max_implementation_attempts}",
+            timeout=attempt_timeout,
+        )
 
         # Check current progress before running (lightweight, no stuck tracking)
         pre_tasks = detector.check_tasks_md()
@@ -709,6 +726,28 @@ def main() -> int:
     try:
         # Phase 1: Setup
         setup = setup_phase(args, config, logger)
+
+        # Adapt budget based on complexity
+        if config.adaptive_budget:
+            complexity = score_complexity(args.change_name, setup.work_dir)
+            config = Config(
+                max_implementation_attempts=complexity.recommended_attempts,
+                max_review_cycles=config.max_review_cycles,
+                claude_timeout=complexity.recommended_timeout,
+                review_timeout=config.review_timeout,
+                db_path=config.db_path,
+                github_token=config.github_token,
+                max_consecutive_no_progress=config.max_consecutive_no_progress,
+                time_budget_seconds=complexity.recommended_budget,
+                adaptive_budget=config.adaptive_budget,
+            )
+            logger.info(
+                "Adaptive budget applied",
+                level=complexity.level,
+                max_attempts=config.max_implementation_attempts,
+                timeout=config.claude_timeout,
+                budget=config.time_budget_seconds,
+            )
 
         # Phase 2: Implementation
         impl_attempts, setup = implementation_phase(

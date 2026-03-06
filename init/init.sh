@@ -21,6 +21,54 @@ warn()  { echo -e "${YELLOW}[warn]${NC}  $*"; }
 err()   { echo -e "${RED}[error]${NC} $*"; }
 
 # ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+validate_scaffolded() {
+  local has_errors=false
+
+  info "Validating generated workflow files..."
+
+  for f in .github/workflows/*.yml; do
+    [ -f "$f" ] || continue
+
+    # Check YAML syntax
+    if command -v python3 >/dev/null 2>&1; then
+      if python3 -c "import yaml; yaml.safe_load(open('$f'))" 2>/dev/null; then
+        ok "YAML valid: $f"
+      else
+        # Fallback: PyYAML might not be installed
+        if python3 -c "import yaml" 2>/dev/null; then
+          warn "YAML syntax error: $f"
+          has_errors=true
+        else
+          warn "PyYAML not installed, skipping syntax check for $f"
+        fi
+      fi
+    else
+      warn "python3 not found, skipping YAML syntax check"
+    fi
+
+    # Check for remaining template variables
+    if grep -q '{{[A-Z_]*}}' "$f" 2>/dev/null; then
+      warn "Unresolved template variables in $f:"
+      grep -n '{{[A-Z_]*}}' "$f" | while read -r line; do
+        echo "       $line"
+      done
+      has_errors=true
+    fi
+  done
+
+  if [ "$has_errors" = "true" ]; then
+    warn "Validation completed with warnings"
+    return 1
+  else
+    ok "All workflow files validated successfully"
+    return 0
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Detect project type
 # ---------------------------------------------------------------------------
 
@@ -116,6 +164,12 @@ render_template() {
 # ---------------------------------------------------------------------------
 
 main() {
+  # Handle --validate flag
+  if [ "${1:-}" = "--validate" ]; then
+    validate_scaffolded
+    exit $?
+  fi
+
   echo ""
   echo -e "${BLUE}=== devops-toolkit init ===${NC}"
   echo ""
@@ -163,7 +217,80 @@ main() {
     local docker_flag="false"
     [ "$has_docker" = "true" ] && docker_flag="true"
 
-    cat > .github/workflows/ci.yml << CIEOF
+    if [ "$project_type" = "go" ]; then
+      # Go-specific CI: prompt for optional lint tool
+      local go_lint_cmd="golangci-lint run"
+      if ask_yes_no "    Use golangci-lint for Go linting?" "y"; then
+        go_lint_cmd="golangci-lint run"
+      fi
+
+      cat > .github/workflows/ci.yml << CIEOF
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [${base_branch}]
+concurrency:
+  group: ci-\${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    uses: ${TOOLKIT_REPO}/.github/workflows/ci.yml@${TOOLKIT_REF}
+    with:
+      install_command: 'go mod download'
+      test_command: 'go test ./...'
+      build_command: 'go build ./...'
+      lint_command: '${go_lint_cmd}'
+      typecheck_command: 'go vet ./...'
+      docker_build: ${docker_flag}
+    secrets: inherit
+CIEOF
+      ok "Created .github/workflows/ci.yml (Go)"
+
+    elif [ "$project_type" = "python" ]; then
+      # Python-specific CI: prompt for tooling preferences
+      local py_test_cmd="pytest"
+      local py_lint_cmd="ruff check ."
+      local py_typecheck_cmd="mypy ."
+      local py_install_cmd='pip install -e ".[dev]"'
+
+      if ask_yes_no "    Use ruff for Python linting?" "y"; then
+        py_lint_cmd="ruff check ."
+      else
+        py_lint_cmd="flake8"
+      fi
+      if ask_yes_no "    Use mypy for type checking?" "y"; then
+        py_typecheck_cmd="mypy ."
+      else
+        py_typecheck_cmd="echo 'No type check'"
+      fi
+
+      cat > .github/workflows/ci.yml << CIEOF
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [${base_branch}]
+concurrency:
+  group: ci-\${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    uses: ${TOOLKIT_REPO}/.github/workflows/ci.yml@${TOOLKIT_REF}
+    with:
+      install_command: '${py_install_cmd}'
+      test_command: '${py_test_cmd}'
+      build_command: 'echo "No build step"'
+      lint_command: '${py_lint_cmd}'
+      typecheck_command: '${py_typecheck_cmd}'
+      docker_build: ${docker_flag}
+    secrets: inherit
+CIEOF
+      ok "Created .github/workflows/ci.yml (Python)"
+
+    else
+      # Node.js default
+      cat > .github/workflows/ci.yml << CIEOF
 name: CI
 on:
   pull_request:
@@ -179,7 +306,8 @@ jobs:
       docker_build: ${docker_flag}
     secrets: inherit
 CIEOF
-    ok "Created .github/workflows/ci.yml"
+      ok "Created .github/workflows/ci.yml"
+    fi
   fi
 
   if [ "$enable_e2e" = "true" ]; then
@@ -335,6 +463,9 @@ OOEOF
   echo ""
   echo "  3. Commit and push the workflow files"
   echo ""
+
+  # Validate generated files
+  validate_scaffolded
 }
 
 main "$@"

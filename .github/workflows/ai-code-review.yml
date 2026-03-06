@@ -1,0 +1,259 @@
+name: AI PR Code Review
+
+on:
+  workflow_call:
+    inputs:
+      ai_model:
+        type: string
+        default: 'claude-sonnet-4-5-20250514'
+        description: 'Claude model for review'
+      severity_threshold:
+        type: string
+        default: 'medium'
+        description: 'Minimum severity to report (critical, high, medium, low, info)'
+      review_scope:
+        type: string
+        default: 'diff_only'
+        description: 'Review scope: diff_only or full_context'
+      auto_approve:
+        type: boolean
+        default: false
+        description: 'Auto-approve PR if no findings at or above severity_threshold'
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  code-review:
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Checkout devops-toolkit for prompts
+        uses: actions/checkout@v6
+        with:
+          repository: SevFle/devops-toolkit
+          path: .devops-toolkit
+          ref: main
+
+      - name: Get PR diff
+        id: diff
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          DIFF_FILE=$(mktemp)
+          git diff "${BASE_SHA}...${HEAD_SHA}" > "$DIFF_FILE"
+
+          DIFF_SIZE=$(wc -c < "$DIFF_FILE")
+          echo "diff_file=$DIFF_FILE" >> "$GITHUB_OUTPUT"
+          echo "diff_size=$DIFF_SIZE" >> "$GITHUB_OUTPUT"
+
+          # Truncate very large diffs to 150KB
+          if [ "$DIFF_SIZE" -gt 150000 ]; then
+            head -c 150000 "$DIFF_FILE" > "${DIFF_FILE}.truncated"
+            mv "${DIFF_FILE}.truncated" "$DIFF_FILE"
+            echo "::warning::Diff truncated from $DIFF_SIZE to 150KB"
+          fi
+
+      - name: Prepare prompt
+        env:
+          DIFF_FILE: ${{ steps.diff.outputs.diff_file }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+
+          PROMPT_SRC=".devops-toolkit/prompts/ai-code-review.prompt.md"
+          if [ ! -f "$PROMPT_SRC" ]; then
+            echo "::error::Prompt file not found: $PROMPT_SRC"
+            exit 1
+          fi
+
+          cp "$PROMPT_SRC" /tmp/review-prompt.md
+
+          {
+            printf '\n---\n\n## PR Information\n\n'
+            printf '- **Repository:** %s\n' "$REPO"
+            printf '- **PR:** #%s\n' "$PR_NUMBER"
+            printf '- **Title:** %s\n' "$PR_TITLE"
+            printf '- **Author:** %s\n\n' "$PR_AUTHOR"
+            printf '## Diff\n\n```diff\n'
+            cat "$DIFF_FILE"
+            printf '\n```\n'
+          } >> /tmp/review-prompt.md
+
+      - name: Run Claude Code Review
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_MODEL: ${{ inputs.ai_model }}
+        run: |
+          set -euo pipefail
+          RESPONSE_FILE=$(mktemp)
+
+          cat /tmp/review-prompt.md | claude -p \
+            --model "$AI_MODEL" \
+            --max-turns 1 \
+            --allowedTools "" \
+            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+
+          # Extract JSON block
+          JSON_FILE=$(mktemp)
+          if sed -n '/^```json/,/^```$/p' "$RESPONSE_FILE" | sed '1d;$d' > "$JSON_FILE" 2>/dev/null; then
+            if python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$JSON_FILE" 2>/dev/null; then
+              echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+              echo "parse_ok=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::Claude response did not contain valid JSON"
+              echo "parse_ok=false" >> "$GITHUB_OUTPUT"
+              echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::warning::No JSON block found in Claude response"
+            echo "parse_ok=false" >> "$GITHUB_OUTPUT"
+            echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "response_file=$RESPONSE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Filter and post review
+        if: steps.claude.outputs.parse_ok == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JSON_FILE: ${{ steps.claude.outputs.json_file }}
+          SEVERITY_THRESHOLD: ${{ inputs.severity_threshold }}
+          AUTO_APPROVE: ${{ inputs.auto_approve }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          REVIEW_DATA=$(python3 -c "
+          import json, sys
+
+          severity_rank = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
+          threshold = severity_rank.get(sys.argv[2], 2)
+
+          data = json.load(open(sys.argv[1]))
+          summary = data.get('summary', 'AI Code Review complete.')
+          all_findings = data.get('findings', [])
+
+          # Filter by severity threshold
+          findings = [f for f in all_findings if severity_rank.get(f.get('severity','info'), 4) <= threshold]
+
+          # Build review comments
+          comments = []
+          for f in findings:
+              if f.get('file') and f.get('line'):
+                  body = '**[%s] %s**\n\n%s' % (
+                      f.get('severity','').upper(),
+                      f.get('category',''),
+                      f.get('message','')
+                  )
+                  if f.get('suggestion'):
+                      body += '\n\n**Suggestion:** %s' % f['suggestion']
+                  comments.append({
+                      'path': f['file'].lstrip('./'),
+                      'line': int(f['line']),
+                      'body': body
+                  })
+
+          # Determine review event
+          has_blocking = any(
+              severity_rank.get(f.get('severity','info'), 4) <= 1
+              for f in findings
+          )
+
+          auto_approve = sys.argv[3].lower() == 'true'
+
+          if has_blocking:
+              event = 'REQUEST_CHANGES'
+          elif len(findings) == 0 and auto_approve:
+              event = 'APPROVE'
+          else:
+              event = 'COMMENT'
+
+          # Build summary with counts
+          counts = {}
+          for f in findings:
+              s = f.get('severity','unknown')
+              counts[s] = counts.get(s, 0) + 1
+          count_str = ', '.join('%s: %d' % (s.upper(), counts[s]) for s in ['critical','high','medium','low','info'] if s in counts)
+          if count_str:
+              review_body = '## AI Code Review\n\n%s\n\n**Findings:** %s' % (summary, count_str)
+          else:
+              review_body = '## AI Code Review\n\n%s\n\nNo findings at or above threshold.' % summary
+
+          print(json.dumps({
+              'body': review_body,
+              'event': event,
+              'comments': comments
+          }))
+          " "$JSON_FILE" "$SEVERITY_THRESHOLD" "$AUTO_APPROVE")
+
+          echo "$REVIEW_DATA" | gh api \
+            "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
+            --input - || echo "::warning::Failed to post PR review"
+
+      - name: Post fallback comment
+        if: steps.claude.outputs.parse_ok != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RESPONSE_FILE: ${{ steps.claude.outputs.response_file }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          BODY="## AI Code Review\n\nThe AI review did not return structured output. Raw response:\n\n\`\`\`\n$(head -c 5000 "$RESPONSE_FILE" 2>/dev/null || echo '(no response)')\n\`\`\`"
+          gh pr comment "$PR_NUMBER" --body "$BODY" || echo "::warning::Failed to post comment"
+
+      - name: Summary
+        if: always()
+        env:
+          JSON_FILE: ${{ steps.claude.outputs.json_file }}
+          PARSE_OK: ${{ steps.claude.outputs.parse_ok }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## AI Code Review Results"
+            echo ""
+            if [ "${PARSE_OK:-false}" = "true" ]; then
+              python3 -c "
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          print(data.get('summary', 'Review complete.'))
+          print()
+          findings = data.get('findings', [])
+          if not findings:
+              print('No findings.')
+          else:
+              print('| Severity | Category | File | Message |')
+              print('|----------|----------|------|---------|')
+              for f in findings[:20]:
+                  print('| %s | %s | \`%s:%s\` | %s |' % (
+                      f.get('severity','').upper(),
+                      f.get('category',''),
+                      f.get('file','?'),
+                      f.get('line','?'),
+                      f.get('message','')[:80]
+                  ))
+          " "$JSON_FILE" || echo "Failed to parse review data"
+            else
+              echo "Failed to parse Claude response as structured JSON."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,313 @@
+name: OWASP Top 20 Security Audit
+
+on:
+  workflow_call:
+    inputs:
+      ai_model:
+        type: string
+        default: 'claude-sonnet-4-5-20250514'
+        description: 'Claude model for audit'
+      categories:
+        type: string
+        default: 'all'
+        description: 'OWASP categories to audit (all or comma-separated numbers)'
+      severity_filter:
+        type: string
+        default: 'medium'
+        description: 'Minimum severity to report (critical, high, medium, low)'
+      trigger_mode:
+        type: string
+        default: 'dispatch'
+        description: 'How the workflow was triggered (dispatch, cron, pr)'
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  owasp-audit:
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Checkout devops-toolkit for prompts
+        uses: actions/checkout@v6
+        with:
+          repository: SevFle/devops-toolkit
+          path: .devops-toolkit
+          ref: main
+
+      - name: Prepare prompt
+        env:
+          CATEGORIES: ${{ inputs.categories }}
+          SEVERITY: ${{ inputs.severity_filter }}
+        run: |
+          set -euo pipefail
+
+          PROMPT_SRC=".devops-toolkit/prompts/owasp-audit.prompt.md"
+          if [ ! -f "$PROMPT_SRC" ]; then
+            echo "::error::Prompt file not found: $PROMPT_SRC"
+            exit 1
+          fi
+
+          # Substitute filter variables using env vars (safe from injection)
+          sed -e "s|{{CATEGORIES}}|${CATEGORIES}|g" \
+              -e "s|{{SEVERITY}}|${SEVERITY}|g" \
+              "$PROMPT_SRC" > /tmp/audit-prompt.md
+
+          # Append repo file listing
+          {
+            printf '\n---\n\n## Repository File Listing\n\n```\n'
+            find . -type f \
+              -not -path './.git/*' \
+              -not -path './.devops-toolkit/*' \
+              -not -path './node_modules/*' \
+              -not -path './vendor/*' \
+              -not -path './.venv/*' \
+              -not -name '*.lock' \
+              -not -name 'package-lock.json' \
+              -not -name 'yarn.lock' | sort
+            printf '```\n\n'
+          } >> /tmp/audit-prompt.md
+
+          # Append key source files (up to 200KB total)
+          {
+            printf '## Key Source Files\n\n'
+            TOTAL_SIZE=0
+            MAX_SIZE=200000
+            find . -type f \
+              \( -name '*.ts' -o -name '*.js' -o -name '*.py' -o -name '*.go' \
+                 -o -name '*.rb' -o -name '*.java' -o -name '*.rs' -o -name '*.php' \
+                 -o -name '*.yml' -o -name '*.yaml' -o -name '*.json' -o -name '*.toml' \
+                 -o -name '*.env*' -o -name 'Dockerfile*' -o -name '*.sh' \) \
+              -not -path './.git/*' \
+              -not -path './.devops-toolkit/*' \
+              -not -path './node_modules/*' \
+              -not -path './vendor/*' \
+              -not -path './.venv/*' \
+              -not -name '*.lock' \
+              -not -name 'package-lock.json' | sort | while read -r f; do
+              FILE_SIZE=$(wc -c < "$f" 2>/dev/null || echo 0)
+              TOTAL_SIZE=$((TOTAL_SIZE + FILE_SIZE))
+              if [ "$TOTAL_SIZE" -gt "$MAX_SIZE" ]; then
+                break
+              fi
+              printf '### %s\n\n```\n' "$f"
+              head -c 50000 "$f"
+              printf '\n```\n\n'
+            done
+          } >> /tmp/audit-prompt.md
+
+      - name: Run Claude OWASP Audit
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_MODEL: ${{ inputs.ai_model }}
+        run: |
+          set -euo pipefail
+          RESPONSE_FILE=$(mktemp)
+
+          cat /tmp/audit-prompt.md | claude -p \
+            --model "$AI_MODEL" \
+            --max-turns 1 \
+            --allowedTools "" \
+            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+
+          # Extract JSON block
+          JSON_FILE=$(mktemp)
+          if sed -n '/^```json/,/^```$/p' "$RESPONSE_FILE" | sed '1d;$d' > "$JSON_FILE" 2>/dev/null; then
+            if python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$JSON_FILE" 2>/dev/null; then
+              echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+              echo "parse_ok=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::Claude response did not contain valid JSON"
+              echo "parse_ok=false" >> "$GITHUB_OUTPUT"
+              cp "$RESPONSE_FILE" "$JSON_FILE"
+              echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::warning::No JSON block found in Claude response"
+            echo "parse_ok=false" >> "$GITHUB_OUTPUT"
+            cp "$RESPONSE_FILE" "$JSON_FILE"
+            echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "response_file=$RESPONSE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Post PR review comments
+        if: github.event_name == 'pull_request' && steps.claude.outputs.parse_ok == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JSON_FILE: ${{ steps.claude.outputs.json_file }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          COMMENTS=$(python3 -c "
+          import json, sys
+          findings = json.load(open(sys.argv[1]))
+          comments = []
+          for f in findings:
+              if f.get('file') and f.get('line'):
+                  comments.append({
+                      'path': f['file'].lstrip('./'),
+                      'line': int(f['line']),
+                      'body': '**[%s] %s** (%s)\n\n%s\n\n**Recommendation:** %s' % (
+                          f.get('severity','').upper(),
+                          f.get('category',''),
+                          f.get('severity',''),
+                          f.get('description',''),
+                          f.get('recommendation','')
+                      )
+                  })
+          print(json.dumps(comments))
+          " "$JSON_FILE")
+
+          COMMENT_COUNT=$(echo "$COMMENTS" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+
+          if [ "$COMMENT_COUNT" -gt 0 ]; then
+            BODY=$(python3 -c "
+          import json, sys
+          findings = json.load(open(sys.argv[1]))
+          counts = {}
+          for f in findings:
+              s = f.get('severity','unknown')
+              counts[s] = counts.get(s, 0) + 1
+          parts = []
+          for s in ['critical','high','medium','low']:
+              if s in counts:
+                  parts.append('%s: %d' % (s.upper(), counts[s]))
+          print('OWASP Security Audit: ' + ', '.join(parts) if parts else 'OWASP Security Audit: No findings')
+          " "$JSON_FILE")
+
+            REVIEW_PAYLOAD=$(python3 -c "
+          import json, sys
+          comments = json.loads(sys.argv[1])
+          body = sys.argv[2]
+          print(json.dumps({'body': body, 'event': 'COMMENT', 'comments': comments}))
+          " "$COMMENTS" "$BODY")
+
+            echo "$REVIEW_PAYLOAD" | gh api \
+              "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
+              --input - || echo "::warning::Failed to post PR review"
+          fi
+
+      - name: Create GitHub Issue with findings
+        if: github.event_name != 'pull_request' && steps.claude.outputs.parse_ok == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JSON_FILE: ${{ steps.claude.outputs.json_file }}
+        run: |
+          set -euo pipefail
+
+          ISSUE_BODY=$(python3 -c "
+          import json, sys
+          findings = json.load(open(sys.argv[1]))
+          if not findings:
+              print('No security findings detected. The codebase looks clean!')
+              sys.exit(0)
+
+          severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+          findings.sort(key=lambda f: severity_order.get(f.get('severity','low'), 3))
+
+          icons = {'critical': '🔴', 'high': '🟠', 'medium': '🟡', 'low': '🔵'}
+          lines = ['# OWASP Security Audit Results\n']
+          lines.append('| Severity | Count |')
+          lines.append('|----------|-------|')
+          counts = {}
+          for f in findings:
+              s = f.get('severity','unknown')
+              counts[s] = counts.get(s, 0) + 1
+          for s in ['critical','high','medium','low']:
+              if s in counts:
+                  lines.append('| %s %s | %d |' % (icons.get(s,''), s.upper(), counts[s]))
+          lines.append('')
+
+          current_sev = None
+          for f in findings:
+              sev = f.get('severity','unknown')
+              if sev != current_sev:
+                  current_sev = sev
+                  lines.append('## %s %s Findings\n' % (icons.get(sev,''), sev.upper()))
+              lines.append('### %s' % f.get('category',''))
+              lines.append('**File:** \`%s:%s\`\n' % (f.get('file','?'), f.get('line','?')))
+              lines.append(f.get('description',''))
+              lines.append('\n**Recommendation:**')
+              lines.append(f.get('recommendation',''))
+              lines.append('\n---\n')
+
+          print('\n'.join(lines))
+          " "$JSON_FILE")
+
+          if [ -n "$ISSUE_BODY" ]; then
+            TITLE="OWASP Security Audit - $(date +%Y-%m-%d)"
+            gh issue create \
+              --title "$TITLE" \
+              --body "$ISSUE_BODY" \
+              --label "security,audit" 2>/dev/null || \
+            gh issue create \
+              --title "$TITLE" \
+              --body "$ISSUE_BODY" || echo "::warning::Failed to create issue"
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          JSON_FILE: ${{ steps.claude.outputs.json_file }}
+          PARSE_OK: ${{ steps.claude.outputs.parse_ok }}
+          RESPONSE_FILE: ${{ steps.claude.outputs.response_file }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## OWASP Security Audit Results"
+            echo ""
+            if [ "$PARSE_OK" = "true" ]; then
+              python3 -c "
+          import json, sys
+          findings = json.load(open(sys.argv[1]))
+          if not findings:
+              print('No security findings detected.')
+              sys.exit(0)
+          counts = {}
+          for f in findings:
+              s = f.get('severity','unknown')
+              counts[s] = counts.get(s, 0) + 1
+          print('| Severity | Count |')
+          print('|----------|-------|')
+          for s in ['critical','high','medium','low']:
+              if s in counts:
+                  print('| %s | %d |' % (s.upper(), counts[s]))
+          print()
+          print('### Top Findings')
+          print()
+          for f in findings[:10]:
+              print('- **[%s]** %s in \`%s:%s\` - %s' % (
+                  f.get('severity','').upper(),
+                  f.get('category',''),
+                  f.get('file','?'),
+                  f.get('line','?'),
+                  f.get('description','')[:100]
+              ))
+          " "$JSON_FILE" || echo "Failed to parse findings"
+            else
+              echo "Failed to parse Claude response as JSON."
+              echo ""
+              echo "<details><summary>Raw response</summary>"
+              echo ""
+              echo '```'
+              head -c 5000 "$RESPONSE_FILE" 2>/dev/null || echo "(no response)"
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

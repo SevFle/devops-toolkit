@@ -1,0 +1,287 @@
+name: AI API Breaking Change Detection
+
+on:
+  workflow_call:
+    inputs:
+      ai_model:
+        type: string
+        default: 'claude-sonnet-4-5-20250514'
+        description: 'Claude model for analysis'
+      api_type:
+        type: string
+        default: 'auto'
+        description: 'API type to check: auto, rest, graphql, library, database'
+      block_on_breaking:
+        type: boolean
+        default: false
+        description: 'Fail the workflow if breaking changes are detected'
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  api-compat:
+    name: API Compatibility Check
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Extract API surface from base branch
+        id: base-api
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || 'HEAD~1' }}
+        run: |
+          set -euo pipefail
+
+          BASE_FILE=$(mktemp /tmp/api-base-XXXXXX.md)
+
+          echo "## Base Branch API Surface" >> "$BASE_FILE"
+          echo "" >> "$BASE_FILE"
+
+          # Save current ref to return later
+          CURRENT_REF=$(git rev-parse HEAD)
+
+          # Checkout base
+          git checkout "$BASE_REF" 2>/dev/null || git checkout HEAD~1
+
+          # Route definitions (REST)
+          echo "### Route Definitions" >> "$BASE_FILE"
+          echo '```' >> "$BASE_FILE"
+          grep -rnE '(app\.(get|post|put|patch|delete|use)\(|router\.(get|post|put|patch|delete)\(|@(Get|Post|Put|Patch|Delete|RequestMapping)\(|@app\.route)' \
+            --include="*.ts" --include="*.js" --include="*.py" --include="*.java" --include="*.go" . 2>/dev/null | head -500 >> "$BASE_FILE" || echo "No routes found" >> "$BASE_FILE"
+          echo '```' >> "$BASE_FILE"
+
+          # Schema files
+          echo "" >> "$BASE_FILE"
+          echo "### Schema Files" >> "$BASE_FILE"
+          for schema in $(find . -type f \( -name "*.graphql" -o -name "*.gql" -o -name "*.prisma" -o -name "*.proto" -o -name "*schema*" -o -name "*migration*" \) \
+            -not -path './.git/*' -not -path './node_modules/*' -not -path './vendor/*' 2>/dev/null | head -20); do
+            echo "" >> "$BASE_FILE"
+            echo "#### $schema" >> "$BASE_FILE"
+            echo '```' >> "$BASE_FILE"
+            head -500 "$schema" >> "$BASE_FILE" 2>/dev/null || true
+            echo '```' >> "$BASE_FILE"
+          done
+
+          # Public exports
+          echo "" >> "$BASE_FILE"
+          echo "### Public Exports" >> "$BASE_FILE"
+          echo '```' >> "$BASE_FILE"
+          grep -rnE '^export (default |const |function |class |type |interface |enum )' \
+            --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" . 2>/dev/null | head -500 >> "$BASE_FILE" || echo "No exports found" >> "$BASE_FILE"
+          echo '```' >> "$BASE_FILE"
+
+          # Return to head
+          git checkout "$CURRENT_REF" 2>/dev/null
+
+          echo "base_file=$BASE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Extract API surface from head branch
+        id: head-api
+        run: |
+          set -euo pipefail
+
+          HEAD_FILE=$(mktemp /tmp/api-head-XXXXXX.md)
+
+          echo "## Head Branch API Surface" >> "$HEAD_FILE"
+          echo "" >> "$HEAD_FILE"
+
+          # Route definitions (REST)
+          echo "### Route Definitions" >> "$HEAD_FILE"
+          echo '```' >> "$HEAD_FILE"
+          grep -rnE '(app\.(get|post|put|patch|delete|use)\(|router\.(get|post|put|patch|delete)\(|@(Get|Post|Put|Patch|Delete|RequestMapping)\(|@app\.route)' \
+            --include="*.ts" --include="*.js" --include="*.py" --include="*.java" --include="*.go" . 2>/dev/null | head -500 >> "$HEAD_FILE" || echo "No routes found" >> "$HEAD_FILE"
+          echo '```' >> "$HEAD_FILE"
+
+          # Schema files
+          echo "" >> "$HEAD_FILE"
+          echo "### Schema Files" >> "$HEAD_FILE"
+          for schema in $(find . -type f \( -name "*.graphql" -o -name "*.gql" -o -name "*.prisma" -o -name "*.proto" -o -name "*schema*" -o -name "*migration*" \) \
+            -not -path './.git/*' -not -path './node_modules/*' -not -path './vendor/*' 2>/dev/null | head -20); do
+            echo "" >> "$HEAD_FILE"
+            echo "#### $schema" >> "$HEAD_FILE"
+            echo '```' >> "$HEAD_FILE"
+            head -500 "$schema" >> "$HEAD_FILE" 2>/dev/null || true
+            echo '```' >> "$HEAD_FILE"
+          done
+
+          # Public exports
+          echo "" >> "$HEAD_FILE"
+          echo "### Public Exports" >> "$HEAD_FILE"
+          echo '```' >> "$HEAD_FILE"
+          grep -rnE '^export (default |const |function |class |type |interface |enum )' \
+            --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" . 2>/dev/null | head -500 >> "$HEAD_FILE" || echo "No exports found" >> "$HEAD_FILE"
+          echo '```' >> "$HEAD_FILE"
+
+          echo "head_file=$HEAD_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare prompt
+        id: prompt
+        env:
+          API_TYPE: ${{ inputs.api_type }}
+        run: |
+          set -euo pipefail
+
+          PROMPT_FILE=$(mktemp /tmp/api-compat-prompt-XXXXXX.md)
+
+          cat .devops-toolkit/prompts/api-compat.prompt.md > "$PROMPT_FILE"
+
+          echo "" >> "$PROMPT_FILE"
+          echo "---" >> "$PROMPT_FILE"
+          echo "" >> "$PROMPT_FILE"
+          echo "## Configuration" >> "$PROMPT_FILE"
+          echo "- api_type: $API_TYPE" >> "$PROMPT_FILE"
+          echo "" >> "$PROMPT_FILE"
+
+          cat "${{ steps.base-api.outputs.base_file }}" >> "$PROMPT_FILE"
+          echo "" >> "$PROMPT_FILE"
+          cat "${{ steps.head-api.outputs.head_file }}" >> "$PROMPT_FILE"
+
+          echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          RESPONSE_FILE=$(mktemp /tmp/api-compat-response-XXXXXX.txt)
+
+          cat "${{ steps.prompt.outputs.prompt_file }}" | claude -p \
+            --model "${{ inputs.ai_model }}" \
+            --max-turns 1 \
+            --allowedTools "" \
+            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+
+          echo "response_file=$RESPONSE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Parse JSON output
+        id: parse
+        run: |
+          set -euo pipefail
+
+          RESPONSE_FILE="${{ steps.claude.outputs.response_file }}"
+          JSON_FILE=$(mktemp /tmp/api-compat-json-XXXXXX.json)
+
+          if sed -n '/^```json$/,/^```$/p' "$RESPONSE_FILE" | sed '1d;$d' > "$JSON_FILE" 2>/dev/null && [ -s "$JSON_FILE" ]; then
+            if python3 -c "import json; json.load(open('$JSON_FILE'))" 2>/dev/null; then
+              echo "json_valid=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "json_valid=false" >> "$GITHUB_OUTPUT"
+              cat "$RESPONSE_FILE" > "$JSON_FILE"
+            fi
+          else
+            echo "json_valid=false" >> "$GITHUB_OUTPUT"
+            cat "$RESPONSE_FILE" > "$JSON_FILE"
+          fi
+
+          echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+
+          # Count breaking changes
+          BREAKING_COUNT=$(python3 -c "
+          import json
+          try:
+              data = json.load(open('$JSON_FILE'))
+              print(len(data.get('breaking_changes', [])))
+          except:
+              print(0)
+          " 2>/dev/null || echo "0")
+          echo "breaking_count=$BREAKING_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Post PR comment
+        if: github.event.pull_request.number
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          COMMENT_FILE=$(mktemp /tmp/api-compat-comment-XXXXXX.md)
+          JSON_FILE="${{ steps.parse.outputs.json_file }}"
+          BREAKING_COUNT="${{ steps.parse.outputs.breaking_count }}"
+
+          if [ "$BREAKING_COUNT" = "0" ]; then
+            cat > "$COMMENT_FILE" << 'EOF'
+          ## API Compatibility Check
+
+          No breaking changes detected. All API changes are backward-compatible.
+          EOF
+          else
+            echo "## API Compatibility Check" > "$COMMENT_FILE"
+            echo "" >> "$COMMENT_FILE"
+            echo "**$BREAKING_COUNT breaking change(s) detected.**" >> "$COMMENT_FILE"
+            echo "" >> "$COMMENT_FILE"
+
+            if [ "${{ steps.parse.outputs.json_valid }}" = "true" ]; then
+              python3 - "$JSON_FILE" >> "$COMMENT_FILE" << 'PYSCRIPT'
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+
+          for bc in data.get("breaking_changes", []):
+              severity = bc.get("severity", "unknown").upper()
+              print(f"### [{severity}] {bc.get('type', 'unknown')}")
+              print(f"**Path:** `{bc.get('path', 'N/A')}`")
+              if bc.get("file"):
+                  loc = bc["file"]
+                  if bc.get("line"):
+                      loc += f":{bc['line']}"
+                  print(f"**Location:** `{loc}`")
+              print(f"\n{bc.get('description', '')}")
+              if bc.get("migration_hint"):
+                  print(f"\n**Migration:** {bc['migration_hint']}")
+              print()
+
+          compatible = data.get("compatible_changes", [])
+          if compatible:
+              print("<details>")
+              print(f"<summary>Compatible changes ({len(compatible)})</summary>\n")
+              for cc in compatible:
+                  print(f"- **{cc.get('type', '')}**: {cc.get('description', '')}")
+              print("\n</details>")
+          PYSCRIPT
+            else
+              echo '```' >> "$COMMENT_FILE"
+              head -c 60000 "$JSON_FILE" >> "$COMMENT_FILE"
+              echo '```' >> "$COMMENT_FILE"
+            fi
+          fi
+
+          gh pr comment "$PR_NUMBER" --body-file "$COMMENT_FILE"
+
+      - name: Block on breaking changes
+        if: inputs.block_on_breaking && steps.parse.outputs.breaking_count != '0'
+        run: |
+          echo "::error::${{ steps.parse.outputs.breaking_count }} breaking API change(s) detected. Failing workflow."
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+
+          echo "### API Breaking Change Detection" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Model:** ${{ inputs.ai_model }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **API type:** ${{ inputs.api_type }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Breaking changes:** ${{ steps.parse.outputs.breaking_count }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Block on breaking:** ${{ inputs.block_on_breaking }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f "${{ steps.base-api.outputs.base_file }}" \
+                "${{ steps.head-api.outputs.head_file }}" \
+                "${{ steps.prompt.outputs.prompt_file }}" \
+                "${{ steps.claude.outputs.response_file }}" \
+                "${{ steps.parse.outputs.json_file }}" 2>/dev/null || true

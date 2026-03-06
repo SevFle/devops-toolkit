@@ -1,0 +1,411 @@
+name: OpenSpec Interview
+
+on:
+  workflow_call:
+    inputs:
+      ai_model:
+        type: string
+        default: 'claude-sonnet-4-5-20250514'
+        description: 'Claude model for interview'
+      max_questions:
+        type: number
+        default: 15
+        description: 'Safety cap for max interview questions'
+      base_branch:
+        type: string
+        default: 'main'
+        description: 'Default branch of the repository'
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+concurrency:
+  group: openspec-interview-${{ github.event.issue.number || github.event.comment.issue_url || github.event.inputs.issue_number }}
+  cancel-in-progress: true
+
+jobs:
+  openspec-interview:
+    if: >-
+      (github.event_name == 'issues' && github.event.action == 'labeled') ||
+      (github.event_name == 'issue_comment' && github.event.action == 'created' &&
+       github.event.comment.user.type != 'Bot' && contains(github.event.comment.body, '/interview')) ||
+      (github.event_name == 'workflow_dispatch')
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.base_branch }}
+
+      - name: Checkout devops-toolkit for prompts
+        uses: actions/checkout@v6
+        with:
+          repository: SevFle/devops-toolkit
+          path: .devops-toolkit
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "openspec-auto[bot]"
+          git config --global user.email "openspec-auto[bot]@users.noreply.github.com"
+
+      - name: Clear git auth header
+        run: git config --local --unset-all http.https://github.com/.extraheader || true
+
+      - name: Resolve issue number
+        id: resolve-issue
+        run: |
+          set -euo pipefail
+          if [ -z "${GITHUB_EVENT_PATH:-}" ] || [ ! -f "$GITHUB_EVENT_PATH" ]; then
+            echo "Missing GITHUB_EVENT_PATH"
+            exit 1
+          fi
+          ISSUE_NUMBER=$(jq -r 'if .issue?.number then .issue.number elif .comment?.issue_url then (.comment.issue_url | split("/") | last) elif .inputs?.issue_number then .inputs.issue_number else "" end' "$GITHUB_EVENT_PATH")
+          if [ -z "$ISSUE_NUMBER" ] || [ "$ISSUE_NUMBER" = "null" ]; then
+            echo "Missing issue_number in event payload."
+            exit 1
+          fi
+          echo "issue_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
+          echo "ISSUE_NUMBER=$ISSUE_NUMBER" >> $GITHUB_ENV
+
+      - name: Check labels
+        id: label-check
+        uses: actions/github-script@v8
+        env:
+          ISSUE_NUMBER: ${{ steps.resolve-issue.outputs.issue_number }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = process.env.ISSUE_NUMBER;
+            if (!issueNumber) { core.setFailed('Missing issue_number'); return; }
+            const issue = await github.rest.issues.get({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: issueNumber
+            });
+            const hasFinished = issue.data.labels.some(l => l.name === 'interview finished');
+            const hasStart = issue.data.labels.some(l => l.name === 'start-interview');
+            const hasInProgress = issue.data.labels.some(l => l.name === 'interview-in-progress');
+            if (hasStart) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber, name: 'start-interview'
+              });
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: issueNumber, labels: ['interview-in-progress']
+                });
+              } catch (e) { if (e.status !== 404) throw e; }
+            }
+            if (!hasFinished && !hasStart && !hasInProgress) {
+              console.log('No required labels, skipping');
+              process.exit(0);
+            }
+            core.setOutput('should_run', 'true');
+            core.setOutput('has_interview_finished_label', hasFinished ? 'true' : 'false');
+
+      - name: Compute interview state
+        id: interview-state
+        if: steps.label-check.outputs.should_run == 'true'
+        uses: actions/github-script@v8
+        env:
+          ISSUE_NUMBER: ${{ steps.resolve-issue.outputs.issue_number }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = process.env.ISSUE_NUMBER;
+            if (!issueNumber) { core.setFailed('Missing issue_number'); return; }
+            const issue = await github.rest.issues.get({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: issueNumber
+            });
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: issueNumber, per_page: 100
+            });
+            const b64Regex = /<!-- OPENSPEC_STATE_B64: ([A-Za-z0-9+/=]+) -->/;
+            let state = { step: 1, last_turn: null, responses: {} };
+            for (const comment of comments.data.slice().reverse()) {
+              const match = comment.body.match(b64Regex);
+              if (match) {
+                try {
+                  state = JSON.parse(Buffer.from(match[1], 'base64').toString('utf8'));
+                  break;
+                } catch (e) { console.log('Failed to parse state:', e.message); }
+              }
+            }
+            if (typeof state.step !== 'number' || state.step < 1) state.step = 1;
+            if (typeof state.responses !== 'object' || state.responses === null) state.responses = {};
+            const lastTurn = state.last_turn ? new Date(state.last_turn) : new Date(issue.data.created_at);
+            let latestUserResponse = null;
+            let latestUserResponseAt = null;
+            for (const comment of comments.data) {
+              const createdAt = new Date(comment.created_at);
+              if (comment.user?.type === 'Bot' || createdAt < lastTurn) continue;
+              const interviewMatch = (comment.body || '').trim().match(/^\s*\/interview\b([\s\S]*)/i);
+              if (!interviewMatch) continue;
+              const answer = (interviewMatch[1] || '').trim();
+              if (!answer) continue;
+              latestUserResponse = answer;
+              latestUserResponseAt = comment.created_at;
+            }
+            if (latestUserResponse) {
+              state.responses[`q${state.step}`] = latestUserResponse;
+              state.step = Math.min(state.step + 1, 16);
+              state.last_turn = latestUserResponseAt;
+            }
+            const stateJson = JSON.stringify(state);
+            const stateB64 = Buffer.from(stateJson).toString('base64');
+            core.setOutput('current_step', String(state.step));
+            core.setOutput('state_marker', `<!-- OPENSPEC_STATE_B64: ${stateB64} -->`);
+            core.setOutput('state_json', stateJson);
+
+      - name: Fetch issue content
+        id: issue-content
+        if: steps.label-check.outputs.should_run == 'true' && steps.label-check.outputs.has_interview_finished_label != 'true'
+        env:
+          ISSUE_NUMBER: ${{ steps.resolve-issue.outputs.issue_number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_JSON=$(gh issue view "$ISSUE_NUMBER" --json title,body)
+          ISSUE_TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
+          ISSUE_BODY=$(echo "$ISSUE_JSON" | jq -r '.body // ""')
+          echo "issue_title=$ISSUE_TITLE" >> $GITHUB_OUTPUT
+          BODY_FILE=$(mktemp)
+          echo "$ISSUE_BODY" > "$BODY_FILE"
+          echo "issue_body_file=$BODY_FILE" >> $GITHUB_OUTPUT
+
+      - name: Prepare interview prompt
+        if: steps.label-check.outputs.should_run == 'true' && steps.label-check.outputs.has_interview_finished_label != 'true'
+        env:
+          INTERVIEW_STEP: ${{ steps.interview-state.outputs.current_step }}
+          INTERVIEW_STATE_MARKER: ${{ steps.interview-state.outputs.state_marker }}
+          ISSUE_TITLE: ${{ steps.issue-content.outputs.issue_title }}
+          ISSUE_BODY_FILE: ${{ steps.issue-content.outputs.issue_body_file }}
+        run: |
+          PROMPT_SRC=".devops-toolkit/prompts/openspec-auto-interview.prompt.md"
+          if [ ! -f "$PROMPT_SRC" ]; then
+            echo "::error::Prompt file not found: $PROMPT_SRC"
+            exit 1
+          fi
+          sed 's|\$ARGUMENTS|**Context:**\n- Repository: ${{ github.repository }}\n- Issue Number: '"$ISSUE_NUMBER"'\n- Event: ${{ github.event_name }}\n\n**Instructions:**\nFollow the state machine defined below to conduct the OpenSpec interview.|' \
+            "$PROMPT_SRC" > /tmp/interview-prompt.md
+          {
+            printf '\n**USER ISSUE TO INTERVIEW ABOUT**\n\n'
+            printf '**Title:** %s\n\n' "$ISSUE_TITLE"
+            printf '**Body:**\n'
+            cat "$ISSUE_BODY_FILE" 2>/dev/null || echo "(No body provided)"
+            printf '\n\n---\n\n'
+            printf '**Authoritative Workflow State**\n'
+            printf -- '- Current step: %s (dynamic, no fixed limit)\n' "$INTERVIEW_STEP"
+            printf -- '- State marker (append verbatim):\n'
+            printf '%s\n\n' "$INTERVIEW_STATE_MARKER"
+            printf '**YOUR TASK**\n'
+            printf 'Conduct a dynamic interview about the USER ISSUE above.\n'
+            printf 'This is step %s. Ask the next most relevant question.\n' "$INTERVIEW_STEP"
+            printf 'Output ONLY the structured JSON block as defined in your prompt.\n'
+            printf 'Ask in the SAME LANGUAGE as the issue.\n'
+          } >> /tmp/interview-prompt.md
+
+      - name: Run Claude Interview Agent
+        id: claude
+        continue-on-error: true
+        if: steps.label-check.outputs.should_run == 'true' && steps.label-check.outputs.has_interview_finished_label != 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          RESPONSE_FILE=$(mktemp)
+          cat /tmp/interview-prompt.md | claude -p \
+            --model "${{ inputs.ai_model }}" \
+            --max-turns 1 \
+            --allowedTools "" \
+            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+          RESPONSE=$(cat "$RESPONSE_FILE")
+          QUESTION_STEP=$(echo "$RESPONSE" | grep -oP 'OPENSPEC_QUESTION_STEP:\s*\K\d+' | head -1 || true)
+          echo "question_step=$QUESTION_STEP" >> $GITHUB_OUTPUT
+          QUESTION_CONTENT=$(echo "$RESPONSE" | sed -n 's/^OPENSPEC_QUESTION:\s*//p' | head -1 || true)
+          echo "question_content=$QUESTION_CONTENT" >> $GITHUB_OUTPUT
+          INTERVIEW_COMPLETE=$(echo "$RESPONSE" | grep -oP 'OPENSPEC_INTERVIEW_COMPLETE:\s*\K(true|false)' | head -1 || true)
+          echo "interview_complete=$INTERVIEW_COMPLETE" >> $GITHUB_OUTPUT
+          EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
+          {
+            echo "response<<${EOF_MARKER}"
+            head -c 900000 "$RESPONSE_FILE"
+            echo "${EOF_MARKER}"
+          } >> $GITHUB_OUTPUT
+          rm -f "$RESPONSE_FILE"
+
+      - name: Post formatted interview question
+        if: steps.label-check.outputs.should_run == 'true' && steps.label-check.outputs.has_interview_finished_label != 'true'
+        uses: actions/github-script@v8
+        env:
+          QUESTION_STEP: ${{ steps.claude.outputs.question_step }}
+          QUESTION_CONTENT: ${{ steps.claude.outputs.question_content }}
+          RESPONSE: ${{ steps.claude.outputs.response }}
+          ISSUE_NUMBER: ${{ steps.resolve-issue.outputs.issue_number }}
+          STATE_JSON: ${{ steps.interview-state.outputs.state_json }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = process.env.ISSUE_NUMBER;
+            if (!issueNumber) return;
+            const response = (process.env.RESPONSE || '').trim();
+            const stateJson = process.env.STATE_JSON || '{}';
+            let questionStep = (process.env.QUESTION_STEP || '').trim();
+            let questionContent = (process.env.QUESTION_CONTENT || '').trim();
+            if (!questionStep && response) {
+              const m = response.match(/OPENSPEC_QUESTION_STEP:\s*(\d+)/);
+              questionStep = m ? m[1] : '';
+            }
+            if (!questionContent && response) {
+              const m = response.match(/OPENSPEC_QUESTION:\s*([\s\S]*?)(?:\nOPENSPEC_[A-Z_]+:|$)/);
+              questionContent = m ? m[1].trim() : '';
+            }
+            questionContent = questionContent
+              .replace(/\\n/g, '\n')
+              .replace(/<details>[\s\S]*?<\/details>/gi, '')
+              .replace(/<!--[\s\S]*?-->/g, '')
+              .replace(/OPENSPEC_INTERVIEW_COMPLETE:\s*(true|false)\s*/gi, '')
+              .replace(/OPENSPEC_STATE_B64:\s*[A-Za-z0-9+/=]+/gi, '')
+              .replace(/OPENSPEC_QUESTION_STEP:\s*\d+/gi, '')
+              .replace(/^\s*$[\r\n]*/gm, '\n')
+              .trim();
+            if (!questionStep || !questionContent) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: '## Interview Processing Notice\n\nThe agent did not return a structured question. Try `/interview` followed by your response.'
+              });
+              return;
+            }
+            const fmatch = questionContent.match(/^([\s\S]*?)\s*(?:For example:|Example:|Zum Beispiel:)\s*([\s\S]*)$/i);
+            const questionText = fmatch ? fmatch[1].trim() : questionContent;
+            const exampleText = fmatch ? fmatch[2].trim() : '';
+            const questionBlock = exampleText ? `### ${questionText}\n\n${exampleText}` : `### ${questionText}`;
+            const stateB64 = Buffer.from(stateJson).toString('base64');
+            const stateMarker = `<!-- OPENSPEC_STATE_B64: ${stateB64} -->`;
+            const rawDebug = `OPENSPEC_QUESTION_STEP: ${questionStep}\nOPENSPEC_QUESTION: ${questionText}`;
+            const body = `# Interview Iteration ${questionStep}\n\n${questionBlock}\n\n<details>\n<summary>Debug Info</summary>\n\n${rawDebug}\n\n</details>\n\n${stateMarker}`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: issueNumber, per_page: 100
+            });
+            const sameStep = comments.slice().reverse().find(c => {
+              if (c.user?.type !== 'Bot') return false;
+              return (c.body || '').includes(`OPENSPEC_QUESTION_STEP: ${questionStep}`) &&
+                     (c.body || '').includes('# Interview Iteration');
+            });
+            if (sameStep) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: sameStep.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: issueNumber, body
+              });
+            }
+
+      - name: Determine completion
+        id: completion-check
+        if: steps.label-check.outputs.should_run == 'true'
+        uses: actions/github-script@v8
+        env:
+          HAS_FINISHED_LABEL: ${{ steps.label-check.outputs.has_interview_finished_label }}
+          INTERVIEW_COMPLETE: ${{ steps.claude.outputs.interview_complete }}
+          CURRENT_STEP: ${{ steps.interview-state.outputs.current_step }}
+          ISSUE_NUMBER: ${{ steps.resolve-issue.outputs.issue_number }}
+          STATE_JSON: ${{ steps.interview-state.outputs.state_json }}
+          QUESTION_STEP: ${{ steps.claude.outputs.question_step }}
+          QUESTION_CONTENT: ${{ steps.claude.outputs.question_content }}
+          MAX_QUESTIONS: ${{ inputs.max_questions }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = process.env.ISSUE_NUMBER;
+            if (!issueNumber) { core.setOutput('is_complete', 'false'); return; }
+            const hasFinished = process.env.HAS_FINISHED_LABEL === 'true';
+            let interviewComplete = (process.env.INTERVIEW_COMPLETE || '').toLowerCase() === 'true';
+            const currentStep = Number(process.env.CURRENT_STEP || '0');
+            const questionStep = (process.env.QUESTION_STEP || '').trim();
+            const questionContent = (process.env.QUESTION_CONTENT || '').trim();
+            const maxQuestions = Number(process.env.MAX_QUESTIONS || '15');
+            if (interviewComplete && questionStep && questionContent) interviewComplete = false;
+            let responseCount = 0;
+            try {
+              const state = JSON.parse(process.env.STATE_JSON || '{}');
+              responseCount = Object.keys(state.responses || {}).length;
+            } catch (e) {}
+            let isComplete = false;
+            let reason = 'none';
+            if (hasFinished && responseCount >= 1) { isComplete = true; reason = 'label'; }
+            else if (interviewComplete && responseCount >= 3) { isComplete = true; reason = 'agent'; }
+            else if (currentStep > maxQuestions) { isComplete = true; reason = 'safety_cap'; }
+            core.setOutput('is_complete', isComplete ? 'true' : 'false');
+
+      - name: Apply interview finished label
+        if: steps.completion-check.outputs.is_complete == 'true' && steps.label-check.outputs.has_interview_finished_label != 'true'
+        uses: actions/github-script@v8
+        env:
+          ISSUE_NUMBER: ${{ steps.resolve-issue.outputs.issue_number }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const n = process.env.ISSUE_NUMBER;
+            if (!n) return;
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: Number(n), labels: ['interview finished']
+              });
+            } catch (e) { if (e.status !== 404) console.warn(e.message); }
+
+      - name: Remove interview-in-progress label
+        if: steps.completion-check.outputs.is_complete == 'true'
+        uses: actions/github-script@v8
+        env:
+          ISSUE_NUMBER: ${{ steps.resolve-issue.outputs.issue_number }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const n = process.env.ISSUE_NUMBER;
+            if (!n) return;
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: Number(n), name: 'interview-in-progress'
+              });
+            } catch (e) { if (e.status !== 404) console.warn(e.message); }
+
+      - name: Handle Errors
+        if: failure()
+        uses: actions/github-script@v8
+        env:
+          RESOLVED_ISSUE_NUMBER: ${{ steps.resolve-issue.outputs.issue_number }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            let n = process.env.RESOLVED_ISSUE_NUMBER;
+            if (!n) n = process.env.ISSUE_NUMBER;
+            if (!n && context.payload.issue?.number) n = String(context.payload.issue.number);
+            if (!n) return;
+            const parsed = parseInt(n, 10);
+            if (isNaN(parsed)) return;
+            try {
+              const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${context.runId}`;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: parsed,
+                body: `OpenSpec interview encountered an error.\n\n[View workflow run](${runUrl})\n\nRestart by re-adding the \`start-interview\` label.`
+              });
+            } catch (e) { console.log('Failed to post error:', e.message); }

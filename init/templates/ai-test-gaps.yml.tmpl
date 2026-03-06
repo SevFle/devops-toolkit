@@ -1,0 +1,9 @@
+name: Test Gap Analysis
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+jobs:
+  test-gaps:
+    uses: SevFle/devops-toolkit/.github/workflows/ai-test-gaps.yml@main
+    secrets: inherit

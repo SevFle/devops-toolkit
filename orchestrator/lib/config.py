@@ -19,6 +19,7 @@ class Config:
     github_token: str = ""
     max_consecutive_no_progress: int = 2
     time_budget_seconds: int = 6600  # 110 minutes (leaves 10 min buffer for 2h GHA timeout)
+    adaptive_budget: bool = True
 
     @classmethod
     def from_env(cls) -> Config:
@@ -43,6 +44,9 @@ class Config:
             github_token=os.environ.get("GITHUB_TOKEN", ""),
             max_consecutive_no_progress=_int_env("ORCHESTRATOR_MAX_NO_PROGRESS", "2"),
             time_budget_seconds=_int_env("ORCHESTRATOR_TIME_BUDGET", "6600"),
+            adaptive_budget=os.environ.get(
+                "ORCHESTRATOR_ADAPTIVE_BUDGET", "true"
+            ).lower() in ("true", "1", "yes"),
         )
 
     def validate(self) -> list[str]:

@@ -1,0 +1,12 @@
+name: Security
+on:
+  pull_request:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+jobs:
+  security:
+    uses: SevFle/devops-toolkit/.github/workflows/security.yml@main
+    with:
+      scan_docker: {{SCAN_DOCKER}}
+    secrets: inherit

@@ -1,0 +1,172 @@
+name: AI Release Notes Generator
+
+on:
+  workflow_call:
+    inputs:
+      ai_model:
+        type: string
+        default: 'claude-sonnet-4-5-20250514'
+        description: 'Claude model for generation'
+      since_tag:
+        type: string
+        default: ''
+        description: 'Generate notes since this tag (empty = previous tag)'
+      format:
+        type: string
+        default: 'markdown'
+        description: 'Output format'
+      include_internal:
+        type: boolean
+        default: false
+        description: 'Include internal/chore changes in notes'
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+    outputs:
+      release_notes:
+        description: 'Generated release notes in markdown'
+        value: ${{ jobs.generate-notes.outputs.release_notes }}
+
+permissions:
+  contents: read
+
+jobs:
+  generate-notes:
+    name: Generate Release Notes
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    outputs:
+      release_notes: ${{ steps.output.outputs.release_notes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine previous tag
+        id: prev-tag
+        env:
+          SINCE_TAG: ${{ inputs.since_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$SINCE_TAG" ]; then
+            PREV_TAG="$SINCE_TAG"
+          else
+            PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "::warning::No previous tag found. Using initial commit."
+            PREV_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+
+          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Collect git context
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREV_TAG: ${{ steps.prev-tag.outputs.prev_tag }}
+        run: |
+          set -euo pipefail
+
+          CONTEXT_FILE=$(mktemp /tmp/release-context-XXXXXX.md)
+
+          echo "## Git Log ($PREV_TAG..HEAD)" >> "$CONTEXT_FILE"
+          echo '```' >> "$CONTEXT_FILE"
+          git log --oneline "$PREV_TAG..HEAD" >> "$CONTEXT_FILE" 2>/dev/null || echo "No commits found" >> "$CONTEXT_FILE"
+          echo '```' >> "$CONTEXT_FILE"
+
+          echo "" >> "$CONTEXT_FILE"
+          echo "## Diff Stats" >> "$CONTEXT_FILE"
+          echo '```' >> "$CONTEXT_FILE"
+          git diff --stat "$PREV_TAG..HEAD" >> "$CONTEXT_FILE" 2>/dev/null || echo "No diff available" >> "$CONTEXT_FILE"
+          echo '```' >> "$CONTEXT_FILE"
+
+          echo "" >> "$CONTEXT_FILE"
+          echo "## Merged Pull Requests" >> "$CONTEXT_FILE"
+          echo '```' >> "$CONTEXT_FILE"
+          gh pr list --state merged --base main --json number,title,author,labels --limit 100 2>/dev/null >> "$CONTEXT_FILE" || echo "No PR data available" >> "$CONTEXT_FILE"
+          echo '```' >> "$CONTEXT_FILE"
+
+          echo "context_file=$CONTEXT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare prompt
+        id: prompt
+        env:
+          INCLUDE_INTERNAL: ${{ inputs.include_internal }}
+        run: |
+          set -euo pipefail
+
+          PROMPT_FILE=$(mktemp /tmp/release-prompt-XXXXXX.md)
+
+          cat .devops-toolkit/prompts/release-notes.prompt.md > "$PROMPT_FILE"
+
+          echo "" >> "$PROMPT_FILE"
+          echo "---" >> "$PROMPT_FILE"
+          echo "" >> "$PROMPT_FILE"
+          echo "## Configuration" >> "$PROMPT_FILE"
+          echo "- include_internal: $INCLUDE_INTERNAL" >> "$PROMPT_FILE"
+          echo "" >> "$PROMPT_FILE"
+          cat "${{ steps.context.outputs.context_file }}" >> "$PROMPT_FILE"
+
+          echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          RESPONSE_FILE=$(mktemp /tmp/release-notes-response-XXXXXX.txt)
+
+          cat "${{ steps.prompt.outputs.prompt_file }}" | claude -p \
+            --model "${{ inputs.ai_model }}" \
+            --max-turns 1 \
+            --allowedTools "" \
+            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+
+          echo "response_file=$RESPONSE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Extract release notes
+        id: output
+        run: |
+          set -euo pipefail
+
+          RESPONSE_FILE="${{ steps.claude.outputs.response_file }}"
+          NOTES_FILE=$(mktemp /tmp/release-notes-final-XXXXXX.md)
+
+          # The prompt asks for pure markdown (no code fences), so use the response directly
+          # But strip any accidental code fence wrappers
+          sed '/^```markdown$/d; /^```$/d' "$RESPONSE_FILE" > "$NOTES_FILE"
+
+          # Set multiline output
+          EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
+          {
+            echo "release_notes<<${EOF_MARKER}"
+            cat "$NOTES_FILE"
+            echo "${EOF_MARKER}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Write to step summary
+        run: |
+          set -euo pipefail
+
+          NOTES_FILE="${{ steps.output.outputs.notes_file }}"
+          echo "### Generated Release Notes" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat "$NOTES_FILE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f "${{ steps.context.outputs.context_file }}" \
+                "${{ steps.prompt.outputs.prompt_file }}" \
+                "${{ steps.claude.outputs.response_file }}" \
+                "${{ steps.output.outputs.notes_file }}" 2>/dev/null || true

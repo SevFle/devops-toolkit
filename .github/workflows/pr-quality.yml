@@ -1,0 +1,117 @@
+name: PR Quality Gate
+
+on:
+  workflow_call:
+    inputs:
+      max_lines_warn:
+        type: number
+        default: 400
+        description: 'Lines changed threshold for warning'
+      max_lines_block:
+        type: number
+        default: 800
+        description: 'Lines changed threshold for blocking'
+      require_conventional_commits:
+        type: boolean
+        default: true
+        description: 'Require conventional commit format on PR title'
+      require_changelog:
+        type: boolean
+        default: false
+        description: 'Require CHANGELOG.md to be modified'
+      branch_pattern:
+        type: string
+        default: ''
+        description: 'Regex pattern for valid branch names'
+      runners:
+        type: string
+        default: 'self-hosted'
+        description: 'Runner label(s), JSON array or string'
+
+jobs:
+  quality-gate:
+    name: Quality Gate
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run quality checks
+        id: checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BRANCH: ${{ github.head_ref }}
+          MAX_LINES_WARN: ${{ inputs.max_lines_warn }}
+          MAX_LINES_BLOCK: ${{ inputs.max_lines_block }}
+          REQUIRE_CONVENTIONAL: ${{ inputs.require_conventional_commits }}
+          REQUIRE_CHANGELOG: ${{ inputs.require_changelog }}
+          BRANCH_PATTERN: ${{ inputs.branch_pattern }}
+        run: |
+          set -euo pipefail
+
+          FAILED=false
+          COMMENT="## PR Quality Gate Results\n\n| Check | Status | Details |\n|-------|--------|---------|"
+
+          # --- Diff size check ---
+          DIFF_STAT=$(gh pr diff "$PR_NUMBER" --stat | tail -1)
+          TOTAL_LINES=$(echo "$DIFF_STAT" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo 0)
+          DELETED_LINES=$(echo "$DIFF_STAT" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo 0)
+          CHANGED=$((TOTAL_LINES + DELETED_LINES))
+
+          if [ "$CHANGED" -gt "$MAX_LINES_BLOCK" ]; then
+            COMMENT="$COMMENT\n| Diff Size | FAIL | $CHANGED lines changed (max: $MAX_LINES_BLOCK) |"
+            FAILED=true
+          elif [ "$CHANGED" -gt "$MAX_LINES_WARN" ]; then
+            COMMENT="$COMMENT\n| Diff Size | WARN | $CHANGED lines changed (recommended max: $MAX_LINES_WARN) |"
+          else
+            COMMENT="$COMMENT\n| Diff Size | PASS | $CHANGED lines changed |"
+          fi
+
+          # --- Conventional commit check ---
+          if [ "$REQUIRE_CONVENTIONAL" = "true" ]; then
+            PATTERN='^(feat|fix|refactor|docs|test|chore|perf|ci)(\(.+\))?: .+'
+            if echo "$PR_TITLE" | grep -Eq "$PATTERN"; then
+              COMMENT="$COMMENT\n| Commit Format | PASS | Title follows conventional commits |"
+            else
+              COMMENT="$COMMENT\n| Commit Format | FAIL | Title must match: type(scope): description |"
+              FAILED=true
+            fi
+          fi
+
+          # --- Changelog check ---
+          if [ "$REQUIRE_CHANGELOG" = "true" ]; then
+            CHANGED_FILES=$(gh pr diff "$PR_NUMBER" --name-only)
+            if echo "$CHANGED_FILES" | grep -q "CHANGELOG.md"; then
+              COMMENT="$COMMENT\n| Changelog | PASS | CHANGELOG.md updated |"
+            else
+              COMMENT="$COMMENT\n| Changelog | FAIL | CHANGELOG.md not updated |"
+              FAILED=true
+            fi
+          fi
+
+          # --- Branch name check ---
+          if [ -n "$BRANCH_PATTERN" ]; then
+            if echo "$PR_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+              COMMENT="$COMMENT\n| Branch Name | PASS | Matches pattern |"
+            else
+              COMMENT="$COMMENT\n| Branch Name | FAIL | Branch '$PR_BRANCH' does not match pattern '$BRANCH_PATTERN' |"
+              FAILED=true
+            fi
+          fi
+
+          # --- Post comment ---
+          echo -e "$COMMENT" | gh pr comment "$PR_NUMBER" --body-file -
+
+          # --- Summary ---
+          echo -e "$COMMENT" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FAILED" = "true" ]; then
+            echo "::error::PR quality gate failed"
+            exit 1
+          fi
+
+          echo "All quality checks passed!"

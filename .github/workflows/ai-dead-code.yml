@@ -1,0 +1,314 @@
+name: AI Dead Code & Dependency Analysis
+
+on:
+  workflow_call:
+    inputs:
+      ai_model:
+        type: string
+        default: 'claude-sonnet-4-5-20250514'
+        description: 'Claude model for analysis'
+      auto_remove:
+        type: boolean
+        default: false
+        description: 'If true, create cleanup branch + PR. If false, create issue with findings.'
+      categories:
+        type: string
+        default: 'all'
+        description: 'Comma-separated categories: unused_exports,orphaned_files,unused_deps,unreachable,deprecated (or all)'
+      runners:
+        type: string
+        default: 'self-hosted'
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  dead-code-analysis:
+    name: Dead Code Analysis
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Generate file tree and dependency context
+        id: context
+        run: |
+          set -euo pipefail
+
+          CONTEXT_FILE=$(mktemp /tmp/dead-code-context-XXXXXX.md)
+
+          echo "## File Tree" >> "$CONTEXT_FILE"
+          echo '```' >> "$CONTEXT_FILE"
+          find . -type f \
+            -not -path './.git/*' \
+            -not -path './node_modules/*' \
+            -not -path './__pycache__/*' \
+            -not -path './vendor/*' \
+            -not -path './dist/*' \
+            -not -path './build/*' \
+            -not -path './.devops-toolkit/*' | sort >> "$CONTEXT_FILE"
+          echo '```' >> "$CONTEXT_FILE"
+
+          echo "" >> "$CONTEXT_FILE"
+          echo "## Dependency Manifests" >> "$CONTEXT_FILE"
+
+          for manifest in package.json requirements.txt go.mod Cargo.toml pyproject.toml pom.xml build.gradle Gemfile; do
+            if [ -f "$manifest" ]; then
+              echo "" >> "$CONTEXT_FILE"
+              echo "### $manifest" >> "$CONTEXT_FILE"
+              echo '```' >> "$CONTEXT_FILE"
+              cat "$manifest" >> "$CONTEXT_FILE"
+              echo '```' >> "$CONTEXT_FILE"
+            fi
+          done
+
+          echo "" >> "$CONTEXT_FILE"
+          echo "## Source File Contents (imports/exports)" >> "$CONTEXT_FILE"
+
+          # Collect import/export lines from source files
+          find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" -o -name "*.py" -o -name "*.go" -o -name "*.rs" \) \
+            -not -path './.git/*' \
+            -not -path './node_modules/*' \
+            -not -path './vendor/*' \
+            -not -path './dist/*' \
+            -not -path './build/*' | head -200 | while read -r file; do
+            IMPORTS=$(grep -nE '(^import |^from |^require\(|^export |^module\.exports)' "$file" 2>/dev/null || true)
+            if [ -n "$IMPORTS" ]; then
+              echo "" >> "$CONTEXT_FILE"
+              echo "### $file" >> "$CONTEXT_FILE"
+              echo '```' >> "$CONTEXT_FILE"
+              echo "$IMPORTS" >> "$CONTEXT_FILE"
+              echo '```' >> "$CONTEXT_FILE"
+            fi
+          done
+
+          echo "context_file=$CONTEXT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare prompt
+        id: prompt
+        env:
+          CATEGORIES: ${{ inputs.categories }}
+        run: |
+          set -euo pipefail
+
+          PROMPT_FILE=$(mktemp /tmp/dead-code-prompt-XXXXXX.md)
+
+          cat .devops-toolkit/prompts/dead-code-analysis.prompt.md > "$PROMPT_FILE"
+
+          echo "" >> "$PROMPT_FILE"
+          echo "---" >> "$PROMPT_FILE"
+          echo "" >> "$PROMPT_FILE"
+          echo "## Categories to Analyze" >> "$PROMPT_FILE"
+          echo "$CATEGORIES" >> "$PROMPT_FILE"
+          echo "" >> "$PROMPT_FILE"
+          echo "## Codebase Context" >> "$PROMPT_FILE"
+          cat "${{ steps.context.outputs.context_file }}" >> "$PROMPT_FILE"
+
+          echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude analysis
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          RESPONSE_FILE=$(mktemp /tmp/dead-code-response-XXXXXX.txt)
+
+          cat "${{ steps.prompt.outputs.prompt_file }}" | claude -p \
+            --model "${{ inputs.ai_model }}" \
+            --max-turns 1 \
+            --allowedTools "" \
+            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+
+          echo "response_file=$RESPONSE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Parse JSON output
+        id: parse
+        run: |
+          set -euo pipefail
+
+          RESPONSE_FILE="${{ steps.claude.outputs.response_file }}"
+          JSON_FILE=$(mktemp /tmp/dead-code-json-XXXXXX.json)
+
+          # Extract JSON between ```json and ``` markers
+          if sed -n '/^```json$/,/^```$/p' "$RESPONSE_FILE" | sed '1d;$d' > "$JSON_FILE" 2>/dev/null && [ -s "$JSON_FILE" ]; then
+            if python3 -c "import json; json.load(open('$JSON_FILE'))" 2>/dev/null; then
+              echo "json_valid=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "json_valid=false" >> "$GITHUB_OUTPUT"
+              cat "$RESPONSE_FILE" > "$JSON_FILE"
+            fi
+          else
+            echo "json_valid=false" >> "$GITHUB_OUTPUT"
+            cat "$RESPONSE_FILE" > "$JSON_FILE"
+          fi
+
+          echo "json_file=$JSON_FILE" >> "$GITHUB_OUTPUT"
+
+          # Count total issues
+          TOTAL=$(python3 -c "
+          import json
+          try:
+              data = json.load(open('$JSON_FILE'))
+              total = len(data.get('dead_exports', [])) + len(data.get('orphaned_files', [])) + len(data.get('unused_deps', [])) + len(data.get('unreachable', [])) + len(data.get('deprecated', []))
+              print(total)
+          except:
+              print(0)
+          " 2>/dev/null || echo "0")
+          echo "total_issues=$TOTAL" >> "$GITHUB_OUTPUT"
+
+      - name: Auto-remove dead code (create PR)
+        if: inputs.auto_remove && steps.parse.outputs.json_valid == 'true' && steps.parse.outputs.total_issues != '0'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          BRANCH="chore/dead-code-cleanup-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+          git config user.name "devops-toolkit[bot]"
+          git config user.email "devops-toolkit[bot]@users.noreply.github.com"
+
+          CLEANUP_PROMPT=$(mktemp /tmp/dead-code-cleanup-XXXXXX.md)
+          cat > "$CLEANUP_PROMPT" << 'EOF'
+          You are a code cleanup agent. Based on the dead code analysis results below, remove the identified dead code from the codebase.
+
+          Rules:
+          - Only remove code that is confirmed dead (listed in the analysis)
+          - Do NOT remove entry points, test files, or configuration files
+          - Remove unused imports when you remove dead exports
+          - Remove orphaned files entirely
+          - Remove unused dependencies from manifest files
+          - Leave a brief comment if removal might surprise future developers
+
+          ## Dead Code Analysis Results
+          EOF
+
+          cat "${{ steps.parse.outputs.json_file }}" >> "$CLEANUP_PROMPT"
+
+          cat "$CLEANUP_PROMPT" | claude -p \
+            --model "${{ inputs.ai_model }}" \
+            --max-turns 5 \
+            --allowedTools "Edit,Write,Bash" \
+            --output-format text > /dev/null 2>&1 || true
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "chore: remove dead code identified by AI analysis"
+            git push origin "$BRANCH"
+
+            gh pr create \
+              --title "chore: automated dead code cleanup" \
+              --body "## Dead Code Cleanup
+
+          This PR was automatically generated by the Dead Code & Dependency Analysis workflow.
+
+          Please review all removals carefully before merging." \
+              --base "${{ github.ref_name }}" \
+              --head "$BRANCH"
+          else
+            echo "No changes were made by the cleanup agent."
+          fi
+
+      - name: Create issue (dry-run)
+        if: (!inputs.auto_remove) && steps.parse.outputs.total_issues != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          JSON_FILE="${{ steps.parse.outputs.json_file }}"
+          BODY_FILE=$(mktemp /tmp/dead-code-issue-XXXXXX.md)
+
+          cat > "$BODY_FILE" << 'HEADER'
+          ## Dead Code & Dependency Analysis Report
+
+          The following dead code was identified by automated AI analysis. Review each finding before removing.
+
+          HEADER
+
+          if [ "${{ steps.parse.outputs.json_valid }}" = "true" ]; then
+            python3 - "$JSON_FILE" >> "$BODY_FILE" << 'PYSCRIPT'
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+
+          if data.get("dead_exports"):
+              print("### Unused Exports\n")
+              for item in data["dead_exports"]:
+                  print(f"- **{item['name']}** ({item['type']}) in `{item['file']}`")
+              print()
+
+          if data.get("orphaned_files"):
+              print("### Orphaned Files\n")
+              for f in data["orphaned_files"]:
+                  print(f"- `{f}`")
+              print()
+
+          if data.get("unused_deps"):
+              print("### Unused Dependencies\n")
+              for d in data["unused_deps"]:
+                  print(f"- `{d}`")
+              print()
+
+          if data.get("unreachable"):
+              print("### Unreachable Code\n")
+              for item in data["unreachable"]:
+                  print(f"- `{item['file']}:{item.get('line', '?')}` -- {item['description']}")
+              print()
+
+          if data.get("deprecated"):
+              print("### Deprecated Patterns\n")
+              for item in data["deprecated"]:
+                  print(f"- `{item['file']}:{item.get('line', '?')}` -- {item['pattern']} -> {item.get('replacement', 'N/A')}")
+              print()
+
+          summary = data.get("summary", {})
+          if summary:
+              print(f"### Summary\n")
+              print(f"- **Total issues:** {summary.get('total_issues', 'N/A')}")
+              sev = summary.get("by_severity", {})
+              if sev:
+                  print(f"- **High:** {sev.get('high', 0)} | **Medium:** {sev.get('medium', 0)} | **Low:** {sev.get('low', 0)}")
+          PYSCRIPT
+          else
+            echo "### Raw Analysis Output" >> "$BODY_FILE"
+            echo "" >> "$BODY_FILE"
+            echo '```' >> "$BODY_FILE"
+            head -c 60000 "$JSON_FILE" >> "$BODY_FILE"
+            echo '```' >> "$BODY_FILE"
+          fi
+
+          gh issue create \
+            --title "Dead Code Analysis: ${{ steps.parse.outputs.total_issues }} issues found" \
+            --body-file "$BODY_FILE" \
+            --label "tech-debt,automated"
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+
+          echo "### Dead Code & Dependency Analysis" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Model:** ${{ inputs.ai_model }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Categories:** ${{ inputs.categories }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Auto-remove:** ${{ inputs.auto_remove }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Total issues found:** ${{ steps.parse.outputs.total_issues }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **JSON valid:** ${{ steps.parse.outputs.json_valid }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f "${{ steps.context.outputs.context_file }}" \
+                "${{ steps.prompt.outputs.prompt_file }}" \
+                "${{ steps.claude.outputs.response_file }}" \
+                "${{ steps.parse.outputs.json_file }}" 2>/dev/null || true

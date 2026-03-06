@@ -1,0 +1,159 @@
+name: Security Scanning
+
+on:
+  workflow_call:
+    inputs:
+      severity_threshold:
+        type: string
+        default: 'high'
+        description: 'Minimum severity to report (low, medium, high, critical)'
+      scan_docker:
+        type: boolean
+        default: false
+        description: 'Whether to scan Docker image with Trivy'
+      ignore_paths:
+        type: string
+        default: ''
+        description: 'Comma-separated paths to ignore in secret detection'
+      runners:
+        type: string
+        default: 'self-hosted'
+        description: 'Runner label(s), JSON array or string'
+
+jobs:
+  secret-detection:
+    name: Secret Detection
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: secret-detection
+        continue-on-error: true
+
+  dependency-audit:
+    name: Dependency Audit
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect project type
+        id: detect
+        run: |
+          set -euo pipefail
+          echo "has_node=$(test -f package.json && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "has_python_requirements=$(test -f requirements.txt && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "has_python_pyproject=$(test -f pyproject.toml && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "has_go=$(test -f go.mod && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Node.js audit
+        if: steps.detect.outputs.has_node == 'true'
+        run: |
+          set -euo pipefail
+          npm audit --audit-level=${{ inputs.severity_threshold }} --json > npm-audit.json || true
+          echo "## npm audit results" >> "$GITHUB_STEP_SUMMARY"
+          npm audit --audit-level=${{ inputs.severity_threshold }} 2>&1 | tail -20 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Python audit (requirements.txt)
+        if: steps.detect.outputs.has_python_requirements == 'true'
+        run: |
+          set -euo pipefail
+          pip install pip-audit
+          pip-audit -r requirements.txt --format json --output pip-audit.json || true
+          pip-audit -r requirements.txt --desc >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Python audit (pyproject.toml)
+        if: steps.detect.outputs.has_python_pyproject == 'true' && steps.detect.outputs.has_python_requirements == 'false'
+        run: |
+          set -euo pipefail
+          pip install pip-audit
+          pip-audit --format json --output pip-audit.json || true
+          pip-audit --desc >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Go vulnerability check
+        if: steps.detect.outputs.has_go == 'true'
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./... >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+
+  container-scan:
+    name: Container Scan
+    if: inputs.scan_docker
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build Docker image for scanning
+        uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: scan-target:latest
+
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'scan-target:latest'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: ${{ inputs.severity_threshold == 'low' && 'LOW,MEDIUM,HIGH,CRITICAL' || inputs.severity_threshold == 'medium' && 'MEDIUM,HIGH,CRITICAL' || inputs.severity_threshold == 'high' && 'HIGH,CRITICAL' || 'CRITICAL' }}
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: container-scan
+
+  security-status:
+    name: Security Status
+    if: always()
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    needs: [secret-detection, dependency-audit, container-scan]
+    steps:
+      - name: Check results
+        run: |
+          set -euo pipefail
+          echo "## Security Scan Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Check | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Secret Detection | ${{ needs.secret-detection.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Dependency Audit | ${{ needs.dependency-audit.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Container Scan | ${{ needs.container-scan.result }} |" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${{ needs.secret-detection.result }}" == "failure" ]] || \
+             [[ "${{ needs.dependency-audit.result }}" == "failure" ]]; then
+            echo "::error::Security checks failed"
+            exit 1
+          fi
+
+          if [[ "${{ needs.container-scan.result }}" == "failure" ]]; then
+            echo "::error::Container scan failed"
+            exit 1
+          fi
+
+          echo "All security checks passed!"
