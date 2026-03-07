@@ -26,7 +26,6 @@ on:
       runners:
         type: string
         default: 'self-hosted'
-    secrets: {}
 
 permissions:
   pull-requests: write

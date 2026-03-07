@@ -18,7 +18,6 @@ on:
       runners:
         type: string
         default: 'self-hosted'
-    secrets: {}
 
 permissions:
   issues: write

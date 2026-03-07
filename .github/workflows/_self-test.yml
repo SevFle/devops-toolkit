@@ -38,6 +38,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Install dependencies
+        working-directory: orchestrator
+        run: pip install pytest
       - name: Run tests
         working-directory: orchestrator
         run: python -m pytest tests/ -v

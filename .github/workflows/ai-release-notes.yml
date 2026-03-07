@@ -26,7 +26,6 @@ on:
       runners:
         type: string
         default: 'self-hosted'
-    secrets: {}
     outputs:
       release_notes:
         description: 'Generated release notes in markdown'
