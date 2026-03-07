@@ -66,6 +66,8 @@ on:
       runners:
         type: string
         default: 'self-hosted'
+        # Accepted formats: plain string (e.g. "self-hosted") or valid JSON array
+        # (e.g. '["self-hosted", "linux"]'). Invalid JSON will cause a runtime error.
         description: 'Runner label(s), JSON array or string'
 
 jobs:

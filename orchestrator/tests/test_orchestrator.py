@@ -6,11 +6,10 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from lib.config import Config
 from lib.log import StructuredLogger
-from lib.reviewer import ClaudeReviewer, ReviewResult
+from lib.reviewer import ClaudeReviewer
 
 
 class TestReviewResponseParsing:
@@ -177,10 +176,11 @@ class TestMainExceptionHandlers:
     @patch("orchestrate.parse_args")
     @patch("orchestrate.setup_phase")
     @patch("orchestrate.implementation_phase")
-    def test_system_exit_passes_total_attempts(
+    def test_system_exit_before_impl_keeps_zero_attempts(
         self, mock_impl, mock_setup, mock_args, mock_config_env, mock_history_cls, mock_logger_cls,
     ):
-        """BUG-4: Exception handlers must pass actual total_attempts, not 0."""
+        """BUG-4 edge case: when impl_phase raises before returning,
+        total_attempts stays at its initialized value (0)."""
         from orchestrate import main, SetupResult
 
         mock_args.return_value = MagicMock(
@@ -195,20 +195,16 @@ class TestMainExceptionHandlers:
 
         mock_setup.return_value = SetupResult(work_dir=Path("."), branch_name="test")
 
-        # implementation_phase runs 3 attempts then raises SystemExit
+        # implementation_phase raises before returning a value
         mock_impl.side_effect = SystemExit("Max attempts reached")
 
-        # The key: implementation_phase raises before returning, but
-        # total_attempts should still track the count.
-        # Since impl_phase raises, the variable must be set before the try.
+        # impl_phase raises before returning, so total_attempts stays at
+        # its initialized value (0). This is a regression guard for the edge
+        # case — the companion test below validates the actual fix (total=3).
         main()
 
-        # Check that fail_run was called with total_attempts=0
-        # (impl_phase raised before setting it, so total_attempts stays at 0)
         fail_call = mock_history.fail_run.call_args
         assert fail_call is not None
-        # The total_attempts kwarg - before the fix it's hardcoded to 0
-        # After the fix it uses the actual variable (still 0 if impl raised before setting)
         assert fail_call.kwargs.get("total_attempts", fail_call[1].get("total_attempts")) == 0
 
     @patch("orchestrate.StructuredLogger")

@@ -106,6 +106,7 @@ jobs:
 
       - name: Transfer image to VPS
         run: |
+          set -e
           mkdir -p ~/.ssh
           echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key

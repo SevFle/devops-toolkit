@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from lib.git_ops import (
-    GitError,
     clone_repo,
     commit_progress,
     create_branch,
@@ -132,6 +131,11 @@ class TestCloneRepo:
         # The token should NOT appear in any argument
         for arg in clone_args:
             assert "ghp_secret123" not in arg, f"Token leaked in clone arg: {arg}"
+
+        # Verify auth is passed via http.extraheader
+        assert "-c" in clone_args, "Expected -c flag for git config"
+        assert any("http.extraheader=Authorization: Basic" in arg for arg in clone_args), \
+            "Expected http.extraheader with Authorization header"
 
 
 class TestHasUncommittedChanges:

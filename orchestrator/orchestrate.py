@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import sys
 import time
@@ -272,8 +271,8 @@ def _post_implementation_comment(
 
     lines = [
         f"### Implementation attempt {attempt}/{max_attempts}\n",
-        f"| Metric | Value |",
-        f"|--------|-------|",
+        "| Metric | Value |",
+        "|--------|-------|",
         f"| Status | {status} |",
         f"| Tasks | {tasks_before} → {tasks_after} |",
         f"| Duration | {duration_seconds:.0f}s |",
@@ -479,7 +478,7 @@ def implementation_phase(
 def _format_review_comment(
     cycle: int,
     max_cycles: int,
-    review: "ReviewResult",
+    review: "ReviewResult",  # noqa: F821 — forward ref, imported at call sites
 ) -> str:
     """Format a review result as a PR comment."""
     status = "Approved" if review.approved else "Changes requested"

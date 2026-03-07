@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -114,8 +112,6 @@ def fetch_failed_jobs(run_id: str, repo: str, logger: StructuredLogger) -> list[
     # Parse the log into per-job failures
     # gh log-failed format: "JobName\tStepName\tTimestamp Message"
     failures: dict[str, list[str]] = {}
-    current_job = ""
-    current_step = ""
 
     for line in raw_log.splitlines():
         parts = line.split("\t", 2)
@@ -125,8 +121,6 @@ def fetch_failed_jobs(run_id: str, repo: str, logger: StructuredLogger) -> list[
             key = f"{job_name}::{step_name}"
             if key not in failures:
                 failures[key] = []
-                current_job = job_name
-                current_step = step_name
             failures[key].append(msg)
 
     result_failures = []
