@@ -34,7 +34,7 @@ validate_scaffolded() {
 
     # Check YAML syntax
     if command -v python3 >/dev/null 2>&1; then
-      if python3 -c "import yaml; yaml.safe_load(open('$f'))" 2>/dev/null; then
+      if python3 -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))" "$f" 2>/dev/null; then
         ok "YAML valid: $f"
       else
         # Fallback: PyYAML might not be installed
@@ -152,6 +152,9 @@ render_template() {
 
   # Remove conditional blocks for disabled features
   # {{#FEATURE}}...{{/FEATURE}} blocks
+  # NOTE: This sed command only handles single-level blocks. Nested
+  # {{#FEATURE}}...{{/FEATURE}} blocks are not supported and will produce
+  # incorrect results because the range match consumes the first {{/ delimiter.
   content=$(echo "$content" | sed '/{{#/,/{{\//{/{{#\|{{\//{d}}')
 
   mkdir -p "$(dirname "$output")"

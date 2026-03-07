@@ -66,12 +66,14 @@ on:
       runners:
         type: string
         default: 'self-hosted'
+        # Accepted formats: plain string (e.g. "self-hosted") or valid JSON array
+        # (e.g. '["self-hosted", "linux"]'). Invalid JSON will cause a runtime error.
         description: 'Runner label(s), JSON array or string'
 
 jobs:
   install:
     name: Install Dependencies
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -87,7 +89,7 @@ jobs:
 
   type-check:
     name: Type Check
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     needs: install
     steps:
       - uses: actions/checkout@v6
@@ -103,7 +105,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     needs: install
     steps:
       - uses: actions/checkout@v6
@@ -119,7 +121,7 @@ jobs:
 
   unit-tests:
     name: Unit Tests
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     needs: install
     steps:
       - uses: actions/checkout@v6
@@ -140,7 +142,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     needs: install
     steps:
       - uses: actions/checkout@v6
@@ -160,7 +162,7 @@ jobs:
   docker-build:
     name: Docker Build
     if: inputs.docker_build
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     needs: install
     steps:
       - uses: actions/checkout@v6
@@ -175,11 +177,11 @@ jobs:
   test-report:
     name: Test Report
     if: inputs.test_report
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     needs: unit-tests
     steps:
       - uses: actions/checkout@v6
-      - uses: ./actions/test-report
+      - uses: SevFle/devops-toolkit/actions/test-report@main
         with:
           test_results_path: ${{ inputs.working_directory }}/test-results.xml
           coverage_path: ${{ inputs.working_directory }}/coverage/lcov.info
@@ -188,7 +190,7 @@ jobs:
   ci-status:
     name: CI Status
     if: always()
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     needs: [type-check, lint, unit-tests, build, docker-build]
     steps:
       - name: Check results

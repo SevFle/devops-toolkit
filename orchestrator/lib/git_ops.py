@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import subprocess
 from pathlib import Path
 
@@ -55,9 +56,14 @@ def clone_repo(
     if repo.startswith("http"):
         clone_url = repo
     else:
-        clone_url = f"https://x-access-token:{token}@github.com/{repo}.git"
+        clone_url = f"https://github.com/{repo}.git"
 
-    cmd = ["clone"]
+    # Pass token via http.extraheader to avoid embedding it in the URL
+    # (which could leak in logs or .git/config)
+    credentials = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    auth_header = f"Authorization: Basic {credentials}"
+
+    cmd = ["-c", f"http.extraheader={auth_header}", "clone"]
     if shallow:
         cmd.extend(["--depth", "1"])
     cmd.extend([clone_url, str(dest)])
@@ -108,7 +114,7 @@ def create_branch(
 
     # Create new branch from base
     logger.info("Creating new branch", branch=branch_name, base=base_branch)
-    _run_git(["checkout", "-b", branch_name], cwd=work_dir)
+    _run_git(["checkout", "-b", branch_name, base_branch], cwd=work_dir)
 
 
 def has_uncommitted_changes(work_dir: Path) -> bool:
@@ -132,6 +138,8 @@ def commit_progress(
         logger.info("No changes to commit")
         return False
 
+    # Intentional: git add -A stages all changes, relying on .gitignore
+    # to exclude build artifacts, secrets, and other unwanted files.
     _run_git(["add", "-A"], cwd=work_dir)
 
     message = f"wip: {change_name} - {completed}/{total} tasks complete"

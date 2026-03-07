@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -114,8 +112,6 @@ def fetch_failed_jobs(run_id: str, repo: str, logger: StructuredLogger) -> list[
     # Parse the log into per-job failures
     # gh log-failed format: "JobName\tStepName\tTimestamp Message"
     failures: dict[str, list[str]] = {}
-    current_job = ""
-    current_step = ""
 
     for line in raw_log.splitlines():
         parts = line.split("\t", 2)
@@ -125,8 +121,6 @@ def fetch_failed_jobs(run_id: str, repo: str, logger: StructuredLogger) -> list[
             key = f"{job_name}::{step_name}"
             if key not in failures:
                 failures[key] = []
-                current_job = job_name
-                current_step = step_name
             failures[key].append(msg)
 
     result_failures = []
@@ -250,20 +244,26 @@ def commit_fix(
         logger.info("No changes to commit after fix attempt")
         return False
 
-    subprocess.run(
+    add_result = subprocess.run(
         ["git", "add", "-A"],
         capture_output=True,
         text=True,
         cwd=str(work_dir),
     )
+    if add_result.returncode != 0:
+        logger.error("git add failed", stderr=add_result.stderr[:500])
+        return False
 
     message = f"fix: CI auto-heal attempt {attempt}"
-    subprocess.run(
+    commit_result = subprocess.run(
         ["git", "commit", "-m", message],
         capture_output=True,
         text=True,
         cwd=str(work_dir),
     )
+    if commit_result.returncode != 0:
+        logger.error("git commit failed", stderr=commit_result.stderr[:500])
+        return False
 
     logger.info("Committed CI fix", attempt=attempt)
     return True
@@ -352,12 +352,13 @@ def main() -> int:
             )
 
             if attempt < args.max_attempts:
-                # Refine the prompt to be more insistent
-                prompt = (
+                # Add a single retry prefix (replace if already present)
+                retry_prefix = (
                     "The previous fix attempt produced NO changes. "
                     "The CI is still failing. You MUST modify files to fix these errors.\n\n"
-                    + prompt
                 )
+                if not prompt.startswith(retry_prefix):
+                    prompt = retry_prefix + prompt
 
     # All attempts exhausted
     if args.pr_url:

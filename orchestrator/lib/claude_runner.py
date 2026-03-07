@@ -153,8 +153,8 @@ class ClaudeRunner:
 
             return ClaudeResult(
                 exit_code=-1,
-                stdout=exc.stdout or "" if isinstance(exc.stdout, str) else "",
-                stderr=exc.stderr or "" if isinstance(exc.stderr, str) else "",
+                stdout=(exc.stdout or "") if isinstance(exc.stdout, str) else "",
+                stderr=(exc.stderr or "") if isinstance(exc.stderr, str) else "",
                 duration_seconds=duration,
                 timed_out=True,
             )

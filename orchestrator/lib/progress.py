@@ -59,10 +59,17 @@ class ProgressAssessment:
 class ProgressDetector:
     """Combines openspec CLI, tasks.md parsing, and git diff to assess progress."""
 
-    def __init__(self, change_name: str, work_dir: Path, logger: StructuredLogger) -> None:
+    def __init__(
+        self,
+        change_name: str,
+        work_dir: Path,
+        logger: StructuredLogger,
+        max_consecutive_no_progress: int = 3,
+    ) -> None:
         self._change_name = change_name
         self._work_dir = work_dir
         self._log = logger
+        self._max_consecutive_no_progress = max_consecutive_no_progress
         self._consecutive_no_progress = 0
         self._last_completed: int | None = None
 
@@ -132,7 +139,10 @@ class ProgressDetector:
         """Parse tasks markdown file for checkbox counts."""
         if tasks_file is None:
             # Try default location
-            candidates = list(self._work_dir.glob("**/tasks.md"))
+            candidates = [
+                c for c in self._work_dir.glob("**/tasks.md")
+                if "node_modules" not in c.parts
+            ]
             openspec_candidates = [
                 c for c in candidates
                 if "openspec" in str(c) and self._change_name in str(c)
@@ -140,6 +150,7 @@ class ProgressDetector:
             if openspec_candidates:
                 tasks_file = str(openspec_candidates[0])
             elif candidates:
+                self._log.warning("Using fallback tasks.md search (no openspec match)")
                 tasks_file = str(candidates[0])
             else:
                 self._log.warning("No tasks.md file found")
@@ -267,7 +278,7 @@ class ProgressDetector:
         else:
             self._consecutive_no_progress += 1
 
-        is_stuck = self._consecutive_no_progress >= 3
+        is_stuck = self._consecutive_no_progress >= self._max_consecutive_no_progress
 
         return ProgressAssessment(
             is_complete=is_complete,

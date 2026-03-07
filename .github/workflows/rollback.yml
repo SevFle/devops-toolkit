@@ -74,7 +74,12 @@ jobs:
             if [ "${{ inputs.environment }}" = "production" ]; then
               TARGET=$(git log --format='%H' -n 2 origin/main | tail -1)
             else
-              TARGET=$(git log --format='%H' -n 2 origin/develop | tail -1)
+              if git rev-parse --verify origin/develop >/dev/null 2>&1; then
+                TARGET=$(git log --format='%H' -n 2 origin/develop | tail -1)
+              else
+                echo "::warning::origin/develop not found, falling back to origin/main"
+                TARGET=$(git log --format='%H' -n 2 origin/main | tail -1)
+              fi
             fi
           fi
           echo "commit=$TARGET" >> $GITHUB_OUTPUT
@@ -98,6 +103,23 @@ jobs:
           load: true
           tags: ${{ inputs.image_name }}:rollback
           cache-from: type=gha
+
+      - name: Transfer image to VPS
+        run: |
+          set -e
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p ${{ secrets.DEPLOY_PORT || 22 }} ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+          docker save ${{ inputs.image_name }}:rollback | \
+            ssh -p ${{ secrets.DEPLOY_PORT || 22 }} \
+                -i ~/.ssh/deploy_key \
+                ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+                'docker load'
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
 
       - name: Deploy rollback
         uses: appleboy/ssh-action@v1.2.2

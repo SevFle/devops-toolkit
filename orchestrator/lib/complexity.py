@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -83,7 +84,7 @@ def score_complexity(change_name: str, work_dir: Path) -> ComplexityScore:
     all_text = " ".join(task_texts + [change_name.replace("-", " ").lower()])
     keyword_score = 0.0
     for keyword, weight in COMPLEXITY_KEYWORDS.items():
-        if keyword in all_text:
+        if re.search(r'\b' + re.escape(keyword) + r'\b', all_text):
             keyword_score += weight
 
     # Read proposal for additional context
@@ -91,7 +92,7 @@ def score_complexity(change_name: str, work_dir: Path) -> ComplexityScore:
     if proposal.exists():
         proposal_text = proposal.read_text().lower()
         for keyword, weight in COMPLEXITY_KEYWORDS.items():
-            if keyword in proposal_text:
+            if re.search(r'\b' + re.escape(keyword) + r'\b', proposal_text):
                 keyword_score += weight * 0.5  # half weight for proposal mentions
 
     # Compute raw score: task_count * task_weight + keyword_score

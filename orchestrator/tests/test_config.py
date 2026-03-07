@@ -86,6 +86,16 @@ class TestConfigValidation:
         errors = config.validate()
         assert any("review_timeout" in e for e in errors)
 
+    def test_invalid_time_budget_seconds(self):
+        config = Config(time_budget_seconds=0)
+        errors = config.validate()
+        assert any("time_budget_seconds" in e for e in errors)
+
+    def test_invalid_max_consecutive_no_progress(self):
+        config = Config(max_consecutive_no_progress=0)
+        errors = config.validate()
+        assert any("max_consecutive_no_progress" in e for e in errors)
+
 
 class TestConfigImmutability:
     def test_frozen(self):

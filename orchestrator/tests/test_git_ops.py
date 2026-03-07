@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from lib.git_ops import (
-    GitError,
+    clone_repo,
     commit_progress,
     create_branch,
     has_uncommitted_changes,
@@ -28,7 +28,7 @@ def git_repo():
     """Create a temporary git repo for testing."""
     with tempfile.TemporaryDirectory() as td:
         repo = Path(td)
-        subprocess.run(["git", "init"], cwd=str(repo), capture_output=True)
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), capture_output=True)
         subprocess.run(
             ["git", "config", "user.email", "test@test.com"],
             cwd=str(repo), capture_output=True,
@@ -59,6 +59,42 @@ class TestCreateBranch:
         )
         assert result.stdout.strip() == "openspec/test"
 
+    def test_creates_branch_from_base_branch(self, git_repo, logger):
+        """BUG-6: create_branch must create from specified base_branch, not HEAD."""
+        # Create a 'develop' branch with an extra commit
+        subprocess.run(
+            ["git", "checkout", "-b", "develop"],
+            cwd=str(git_repo), capture_output=True,
+        )
+        (git_repo / "develop_file.py").write_text("develop = True")
+        subprocess.run(["git", "add", "-A"], cwd=str(git_repo), capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "develop commit"],
+            cwd=str(git_repo), capture_output=True,
+        )
+        # Get the develop commit hash
+        develop_hash = subprocess.run(
+            ["git", "rev-parse", "develop"],
+            cwd=str(git_repo), capture_output=True, text=True,
+        ).stdout.strip()
+        # Get the main commit hash
+        main_hash = subprocess.run(
+            ["git", "rev-parse", "main"],
+            cwd=str(git_repo), capture_output=True, text=True,
+        ).stdout.strip()
+
+        # Stay on develop (HEAD != main). create_branch should create from
+        # base_branch="main", NOT from current HEAD (develop).
+        create_branch("openspec/from-main", git_repo, logger, base_branch="main")
+
+        # The new branch should point to the main commit, not develop
+        new_branch_hash = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(git_repo), capture_output=True, text=True,
+        ).stdout.strip()
+        assert new_branch_hash == main_hash
+        assert new_branch_hash != develop_hash
+
     def test_checkout_existing_branch(self, git_repo, logger):
         # Create the branch first
         subprocess.run(
@@ -80,6 +116,26 @@ class TestCreateBranch:
             text=True,
         )
         assert result.stdout.strip() == "openspec/existing"
+
+
+class TestCloneRepo:
+    @patch("lib.git_ops._run_git")
+    def test_clone_does_not_embed_token_in_url(self, mock_run_git, logger, tmp_path):
+        """BUG-5: clone_repo must not embed PAT in the clone URL."""
+        clone_repo("owner/repo", tmp_path / "dest", "ghp_secret123", logger)
+
+        # Get the clone command that was called
+        clone_call = mock_run_git.call_args_list[0]
+        clone_args = clone_call[0][0]  # first positional arg is the args list
+
+        # The token should NOT appear in any argument
+        for arg in clone_args:
+            assert "ghp_secret123" not in arg, f"Token leaked in clone arg: {arg}"
+
+        # Verify auth is passed via http.extraheader
+        assert "-c" in clone_args, "Expected -c flag for git config"
+        assert any("http.extraheader=Authorization: Basic" in arg for arg in clone_args), \
+            "Expected http.extraheader with Authorization header"
 
 
 class TestHasUncommittedChanges:
