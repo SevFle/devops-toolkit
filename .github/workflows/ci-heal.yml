@@ -55,20 +55,20 @@ jobs:
           echo "heal_count=$HEAL_COUNT" >> $GITHUB_OUTPUT
 
       - name: Check heal limit
-        if: steps.pr-info.outputs.heal_count >= inputs.max_attempts
+        if: fromJSON(steps.pr-info.outputs.heal_count) >= inputs.max_attempts
         run: |
           echo "::warning::Auto-heal limit reached. Skipping."
           exit 0
 
       - name: Checkout PR branch
-        if: steps.pr-info.outputs.heal_count < inputs.max_attempts
+        if: fromJSON(steps.pr-info.outputs.heal_count) < inputs.max_attempts
         uses: actions/checkout@v6
         with:
           ref: ${{ steps.pr-info.outputs.branch }}
           fetch-depth: 0
 
       - name: Checkout devops-toolkit
-        if: steps.pr-info.outputs.heal_count < inputs.max_attempts
+        if: fromJSON(steps.pr-info.outputs.heal_count) < inputs.max_attempts
         uses: actions/checkout@v6
         with:
           repository: SevFle/devops-toolkit
@@ -76,13 +76,13 @@ jobs:
           ref: main
 
       - name: Configure Git
-        if: steps.pr-info.outputs.heal_count < inputs.max_attempts
+        if: fromJSON(steps.pr-info.outputs.heal_count) < inputs.max_attempts
         run: |
           git config user.name "devops-toolkit[bot]"
           git config user.email "devops-toolkit[bot]@users.noreply.github.com"
 
       - name: Run CI fix
-        if: steps.pr-info.outputs.heal_count < inputs.max_attempts
+        if: fromJSON(steps.pr-info.outputs.heal_count) < inputs.max_attempts
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}

@@ -66,31 +66,37 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p ${{ secrets.DEPLOY_PORT || 22 }} ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
           docker save ${{ inputs.image_name }}:${{ inputs.version }} | \
-            ssh -o StrictHostKeyChecking=no \
-                -o UserKnownHostsFile=/dev/null \
-                -p ${{ secrets.DEPLOY_PORT || 22 }} \
+            ssh -p ${{ secrets.DEPLOY_PORT || 22 }} \
                 -i ~/.ssh/deploy_key \
                 ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
                 'docker load'
-          rm -f ~/.ssh/deploy_key
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
 
       - name: Deploy to VPS
         uses: appleboy/ssh-action@v1.2.2
+        env:
+          ENV_VARS_CONTENT: ${{ inputs.env_vars }}
+          REQUIRED_ENV_VARS: ${{ inputs.required_env_vars }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: ${{ secrets.DEPLOY_PORT || 22 }}
+          envs: ENV_VARS_CONTENT,REQUIRED_ENV_VARS
           script: |
             set -e
             cd ${{ inputs.deploy_dir }}
 
-            if [ -n "${{ inputs.env_vars }}" ]; then
+            if [ -n "$ENV_VARS_CONTENT" ]; then
               TMP_ENV=$(mktemp)
-              echo "${{ inputs.env_vars }}" > "$TMP_ENV"
+              echo "$ENV_VARS_CONTENT" > "$TMP_ENV"
 
-              IFS=',' read -ra REQUIRED <<< "${{ inputs.required_env_vars }}"
+              IFS=',' read -ra REQUIRED <<< "$REQUIRED_ENV_VARS"
               for var in "${REQUIRED[@]}"; do
                 var=$(echo "$var" | xargs)
                 if [ -n "$var" ] && ! grep -Eq "^${var}=.+$" "$TMP_ENV"; then

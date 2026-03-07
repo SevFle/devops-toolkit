@@ -91,6 +91,14 @@ jobs:
           git push origin HEAD
           git push origin v${{ steps.bump.outputs.version }}
 
+      - name: Checkout devops-toolkit
+        if: inputs.generate_notes
+        uses: actions/checkout@v6
+        with:
+          repository: SevFle/devops-toolkit
+          path: .devops-toolkit
+          ref: main
+
       - name: Generate AI release notes
         if: inputs.generate_notes
         id: ai-notes
