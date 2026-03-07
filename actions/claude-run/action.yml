@@ -77,6 +77,8 @@ runs:
     - name: Prepare prompt
       id: prepare
       shell: bash
+      env:
+        CLAUDE_PROMPT: ${{ inputs.prompt }}
       run: |
         PROMPT_FILE=$(mktemp /tmp/claude-prompt-XXXXXX.md)
 
@@ -85,9 +87,7 @@ runs:
         elif [ "${{ inputs.is_encoded }}" = "true" ]; then
           echo "${{ inputs.prompt }}" | base64 -d > "$PROMPT_FILE"
         else
-          cat > "$PROMPT_FILE" << 'PROMPT_EOF'
-        ${{ inputs.prompt }}
-        PROMPT_EOF
+          printf '%s' "$CLAUDE_PROMPT" > "$PROMPT_FILE"
         fi
 
         echo "prompt_file=$PROMPT_FILE" >> $GITHUB_OUTPUT
@@ -104,8 +104,6 @@ runs:
 
         if [ -n "${{ inputs.allowed_tools }}" ]; then
           CLAUDE_ARGS="$CLAUDE_ARGS --allowedTools ${{ inputs.allowed_tools }}"
-        else
-          CLAUDE_ARGS="$CLAUDE_ARGS --allowedTools \"\""
         fi
 
         cat "${{ steps.prepare.outputs.prompt_file }}" | claude $CLAUDE_ARGS > "$RESPONSE_FILE" 2>&1 || true

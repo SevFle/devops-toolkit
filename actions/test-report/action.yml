@@ -66,7 +66,7 @@ runs:
           # JUnit XML
           python3 -c "
         import xml.etree.ElementTree as ET, sys
-        tree = ET.parse('$FILE')
+        tree = ET.parse(sys.argv[1])
         root = tree.getroot()
         if root.tag == 'testsuites':
             suites = root.findall('testsuite')
@@ -90,12 +90,12 @@ runs:
         print(f'failed={failed}')
         print(f'skipped={skipped}')
         print(f'duration={duration:.2f}')
-        " >> "$GITHUB_OUTPUT"
+        " "$FILE" >> "$GITHUB_OUTPUT"
         elif head -5 "$FILE" | grep -q '{'; then
           # pytest JSON
           python3 -c "
         import json, sys
-        with open('$FILE') as f:
+        with open(sys.argv[1]) as f:
             data = json.load(f)
         summary = data.get('summary', {})
         total = summary.get('total', 0)
@@ -108,7 +108,7 @@ runs:
         print(f'failed={failed}')
         print(f'skipped={skipped}')
         print(f'duration={duration:.2f}')
-        " >> "$GITHUB_OUTPUT"
+        " "$FILE" >> "$GITHUB_OUTPUT"
         else
           echo "::warning::Unknown test results format"
           echo "total_tests=0" >> "$GITHUB_OUTPUT"
@@ -153,7 +153,7 @@ runs:
         total_lines = hit_lines = 0
         per_file = {}
         current_file = ''
-        with open('$FILE') as f:
+        with open(sys.argv[1]) as f:
             for line in f:
                 line = line.strip()
                 if line.startswith('SF:'):
@@ -177,12 +177,12 @@ runs:
             fp = (data['hit'] / data['total'] * 100) if data['total'] > 0 else 0
             parts.append(f'{path}:{fp:.0f}%')
         print('per_file_coverage=' + '|'.join(parts[:20]))
-        " >> "$GITHUB_OUTPUT"
+        " "$FILE" >> "$GITHUB_OUTPUT"
             ;;
           cobertura)
             python3 -c "
-        import xml.etree.ElementTree as ET
-        tree = ET.parse('$FILE')
+        import xml.etree.ElementTree as ET, sys
+        tree = ET.parse(sys.argv[1])
         root = tree.getroot()
         rate = float(root.get('line-rate', 0))
         pct = rate * 100
@@ -194,12 +194,12 @@ runs:
                 r = float(cls.get('line-rate', 0))
                 parts.append(f'{name}:{r*100:.0f}%')
         print('per_file_coverage=' + '|'.join(parts[:20]))
-        " >> "$GITHUB_OUTPUT"
+        " "$FILE" >> "$GITHUB_OUTPUT"
             ;;
           json)
             python3 -c "
-        import json
-        with open('$FILE') as f:
+        import json, sys
+        with open(sys.argv[1]) as f:
             data = json.load(f)
         # Support coverage.py JSON and istanbul JSON formats
         if 'totals' in data:
@@ -219,7 +219,7 @@ runs:
                     fp = info.get('summary', info).get('percent_covered', info.get('pct', 0))
                     parts.append(f'{path}:{fp:.0f}%')
         print('per_file_coverage=' + '|'.join(parts))
-        " >> "$GITHUB_OUTPUT"
+        " "$FILE" >> "$GITHUB_OUTPUT"
             ;;
         esac
 
