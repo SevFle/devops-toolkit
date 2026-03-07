@@ -95,6 +95,39 @@ class TestCheckTasksMd:
         assert result.total == 0
 
 
+class TestCheckTasksMdFallbackGlob:
+    def test_fallback_excludes_node_modules(self, tmp_work_dir, logger):
+        """BUG-39: Fallback glob must exclude node_modules directories."""
+        # Create a tasks.md inside node_modules (should be excluded)
+        nm_dir = tmp_work_dir / "node_modules" / "some-pkg"
+        nm_dir.mkdir(parents=True)
+        (nm_dir / "tasks.md").write_text("- [ ] npm task\n")
+
+        # Create the real tasks.md in the openspec directory
+        change_dir = tmp_work_dir / "openspec" / "changes" / "test-change"
+        change_dir.mkdir(parents=True)
+        (change_dir / "tasks.md").write_text("- [x] done\n- [ ] todo\n")
+
+        detector = ProgressDetector("test-change", tmp_work_dir, logger)
+        result = detector.check_tasks_md()
+
+        assert result is not None
+        assert "node_modules" not in result.file_path
+
+    def test_fallback_with_only_node_modules_returns_none(self, tmp_work_dir, logger):
+        """When only node_modules tasks.md exist, fallback should find nothing useful."""
+        nm_dir = tmp_work_dir / "node_modules" / "some-pkg"
+        nm_dir.mkdir(parents=True)
+        (nm_dir / "tasks.md").write_text("- [ ] npm task\n")
+
+        detector = ProgressDetector("other-change", tmp_work_dir, logger)
+        result = detector.check_tasks_md()
+
+        # Should either be None (all excluded) or not contain node_modules
+        if result is not None:
+            assert "node_modules" not in result.file_path
+
+
 class TestCheckGitDiff:
     @patch("lib.progress.subprocess.run")
     def test_detects_changes(self, mock_run, tmp_work_dir, logger):
@@ -211,6 +244,36 @@ class TestAssessProgress:
         a4 = detector.assess_progress()
         assert a4.is_stuck is True
         assert detector.consecutive_no_progress == 3
+
+    @patch.object(ProgressDetector, "check_openspec_cli")
+    @patch.object(ProgressDetector, "check_tasks_md")
+    @patch.object(ProgressDetector, "check_git_diff")
+    def test_stuck_threshold_uses_config_value(self, mock_diff, mock_tasks, mock_openspec, tmp_work_dir, logger):
+        """BUG-13: ProgressDetector must use configurable max_consecutive_no_progress."""
+        mock_openspec.return_value = OpenSpecProgress(
+            state="ready", completed=0, total=5, remaining=5,
+        )
+        mock_tasks.return_value = TasksMdProgress(completed=0, total=5)
+        mock_diff.return_value = GitDiffResult(
+            has_changes=False, has_meaningful_changes=False, files_changed=0,
+        )
+
+        # Use a custom threshold of 2 instead of default 3
+        detector = ProgressDetector("test-change", tmp_work_dir, logger, max_consecutive_no_progress=2)
+
+        # First run — baseline
+        a1 = detector.assess_progress()
+        assert a1.is_stuck is False
+
+        # Second run — 1 no-progress
+        a2 = detector.assess_progress()
+        assert a2.is_stuck is False
+        assert detector.consecutive_no_progress == 1
+
+        # Third run — 2 consecutive no-progress, should be stuck with threshold=2
+        a3 = detector.assess_progress()
+        assert a3.is_stuck is True
+        assert detector.consecutive_no_progress == 2
 
     @patch.object(ProgressDetector, "check_openspec_cli")
     @patch.object(ProgressDetector, "check_tasks_md")

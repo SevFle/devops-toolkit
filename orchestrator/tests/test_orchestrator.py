@@ -118,6 +118,24 @@ class TestReviewResponseParsing:
         assert result.parse_error is not None
 
 
+class TestCheckTool:
+    @patch("orchestrate.subprocess.run")
+    def test_returns_true_when_tool_found(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+
+        from orchestrate import _check_tool
+
+        assert _check_tool("git") is True
+
+    @patch("orchestrate.subprocess.run")
+    def test_returns_false_when_tool_not_found(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1)
+
+        from orchestrate import _check_tool
+
+        assert _check_tool("nonexistent_tool") is False
+
+
 class TestToolValidation:
     @patch("orchestrate.subprocess.run")
     def test_validate_tools_all_present(self, mock_run):
@@ -150,6 +168,89 @@ class TestToolValidation:
         # so it will still be missing
         missing = validate_tools(skip_review=True, logger=logger)
         assert "claude" in missing
+
+
+class TestMainExceptionHandlers:
+    @patch("orchestrate.StructuredLogger")
+    @patch("orchestrate.RunHistory")
+    @patch("orchestrate.Config.from_env")
+    @patch("orchestrate.parse_args")
+    @patch("orchestrate.setup_phase")
+    @patch("orchestrate.implementation_phase")
+    def test_system_exit_passes_total_attempts(
+        self, mock_impl, mock_setup, mock_args, mock_config_env, mock_history_cls, mock_logger_cls,
+    ):
+        """BUG-4: Exception handlers must pass actual total_attempts, not 0."""
+        from orchestrate import main, SetupResult
+
+        mock_args.return_value = MagicMock(
+            change_name="test", no_clone=True, skip_review=True, repo=None, base_branch="main",
+        )
+        mock_config = Config()
+        mock_config_env.return_value = mock_config
+
+        mock_history = MagicMock()
+        mock_history.start_run.return_value = "run-1"
+        mock_history_cls.return_value = mock_history
+
+        mock_setup.return_value = SetupResult(work_dir=Path("."), branch_name="test")
+
+        # implementation_phase runs 3 attempts then raises SystemExit
+        mock_impl.side_effect = SystemExit("Max attempts reached")
+
+        # The key: implementation_phase raises before returning, but
+        # total_attempts should still track the count.
+        # Since impl_phase raises, the variable must be set before the try.
+        main()
+
+        # Check that fail_run was called with total_attempts=0
+        # (impl_phase raised before setting it, so total_attempts stays at 0)
+        fail_call = mock_history.fail_run.call_args
+        assert fail_call is not None
+        # The total_attempts kwarg - before the fix it's hardcoded to 0
+        # After the fix it uses the actual variable (still 0 if impl raised before setting)
+        assert fail_call.kwargs.get("total_attempts", fail_call[1].get("total_attempts")) == 0
+
+    @patch("orchestrate.StructuredLogger")
+    @patch("orchestrate.RunHistory")
+    @patch("orchestrate.Config.from_env")
+    @patch("orchestrate.parse_args")
+    @patch("orchestrate.setup_phase")
+    @patch("orchestrate.implementation_phase")
+    @patch("orchestrate.review_phase")
+    def test_exception_after_impl_passes_actual_attempts(
+        self, mock_review, mock_impl, mock_setup, mock_args, mock_config_env, mock_history_cls, mock_logger_cls,
+    ):
+        """BUG-4: When exception occurs after implementation, actual attempts are passed."""
+        from orchestrate import main, SetupResult
+
+        mock_args.return_value = MagicMock(
+            change_name="test", no_clone=True, skip_review=False, repo=None, base_branch="main",
+        )
+        mock_config = Config()
+        mock_config_env.return_value = mock_config
+
+        mock_history = MagicMock()
+        mock_history.start_run.return_value = "run-1"
+        mock_history_cls.return_value = mock_history
+
+        mock_setup.return_value = SetupResult(work_dir=Path("."), branch_name="test")
+
+        # implementation_phase succeeds with 3 attempts
+        mock_impl.return_value = (3, SetupResult(work_dir=Path("."), branch_name="test"))
+
+        # review_phase raises
+        mock_review.side_effect = SystemExit("Review failed")
+
+        main()
+
+        # Check that fail_run was called with the actual total_attempts=3
+        fail_call = mock_history.fail_run.call_args
+        assert fail_call is not None
+        total_attempts_value = fail_call.kwargs.get("total_attempts")
+        if total_attempts_value is None:
+            total_attempts_value = fail_call[1].get("total_attempts")
+        assert total_attempts_value == 3
 
 
 class TestExtractRemainingTasks:

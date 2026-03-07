@@ -250,20 +250,26 @@ def commit_fix(
         logger.info("No changes to commit after fix attempt")
         return False
 
-    subprocess.run(
+    add_result = subprocess.run(
         ["git", "add", "-A"],
         capture_output=True,
         text=True,
         cwd=str(work_dir),
     )
+    if add_result.returncode != 0:
+        logger.error("git add failed", stderr=add_result.stderr[:500])
+        return False
 
     message = f"fix: CI auto-heal attempt {attempt}"
-    subprocess.run(
+    commit_result = subprocess.run(
         ["git", "commit", "-m", message],
         capture_output=True,
         text=True,
         cwd=str(work_dir),
     )
+    if commit_result.returncode != 0:
+        logger.error("git commit failed", stderr=commit_result.stderr[:500])
+        return False
 
     logger.info("Committed CI fix", attempt=attempt)
     return True
@@ -352,12 +358,13 @@ def main() -> int:
             )
 
             if attempt < args.max_attempts:
-                # Refine the prompt to be more insistent
-                prompt = (
+                # Add a single retry prefix (replace if already present)
+                retry_prefix = (
                     "The previous fix attempt produced NO changes. "
                     "The CI is still failing. You MUST modify files to fix these errors.\n\n"
-                    + prompt
                 )
+                if not prompt.startswith(retry_prefix):
+                    prompt = retry_prefix + prompt
 
     # All attempts exhausted
     if args.pr_url:

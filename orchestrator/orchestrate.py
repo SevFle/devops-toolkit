@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from lib.complexity import score_complexity, timeout_for_attempt
+from lib.complexity import ComplexityScore, score_complexity, timeout_for_attempt
 from lib.config import Config
 from lib.git_ops import (
     GitError,
@@ -78,12 +78,12 @@ PR_TOOLS = ["gh"]
 def _check_tool(name: str) -> bool:
     """Check if a CLI tool is available on PATH."""
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["which", name],
             capture_output=True,
             timeout=5,
         )
-        return True
+        return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
 
@@ -186,6 +186,7 @@ class SetupResult:
     work_dir: Path
     branch_name: str
     pr_url: str | None = None
+    complexity: ComplexityScore | None = None
 
 
 def setup_phase(
@@ -234,7 +235,7 @@ def setup_phase(
         logger.warning(f"Branch creation issue (may already exist): {exc}")
 
     logger.phase("setup", "Setup complete", branch=branch_name)
-    return SetupResult(work_dir=work_dir, branch_name=branch_name, pr_url=None)
+    return SetupResult(work_dir=work_dir, branch_name=branch_name, pr_url=None, complexity=complexity)
 
 
 def _post_implementation_comment(
@@ -328,7 +329,6 @@ def _check_time_budget(
     """Abort if we've exceeded the time budget."""
     elapsed = time.monotonic() - start_time
     if elapsed >= config.time_budget_seconds:
-        remaining = config.time_budget_seconds - elapsed
         raise SystemExit(
             f"Time budget exhausted during {phase} phase "
             f"({elapsed:.0f}s elapsed, budget={config.time_budget_seconds}s). "
@@ -352,7 +352,7 @@ def implementation_phase(
     logger.phase("implementation", "Starting implementation phase")
 
     runner = ClaudeRunner(config, setup.work_dir, logger)
-    detector = ProgressDetector(args.change_name, setup.work_dir, logger)
+    detector = ProgressDetector(args.change_name, setup.work_dir, logger, config.max_consecutive_no_progress)
     total_attempts = 0
     previous_errors: list[str] = []
     consecutive_push_failures = 0
@@ -532,7 +532,7 @@ def review_phase(
 
     reviewer = ClaudeReviewer(config, setup.work_dir, logger)
     runner = ClaudeRunner(config, setup.work_dir, logger)
-    detector = ProgressDetector(args.change_name, setup.work_dir, logger)
+    detector = ProgressDetector(args.change_name, setup.work_dir, logger, config.max_consecutive_no_progress)
 
     openspec_context = read_openspec_context(args.change_name, setup.work_dir)
     total_cycles = 0
@@ -722,14 +722,15 @@ def main() -> int:
     )
 
     start_time = time.monotonic()
+    total_attempts = 0
 
     try:
         # Phase 1: Setup
         setup = setup_phase(args, config, logger)
 
-        # Adapt budget based on complexity
-        if config.adaptive_budget:
-            complexity = score_complexity(args.change_name, setup.work_dir)
+        # Adapt budget based on complexity (reuse score from setup_phase)
+        if config.adaptive_budget and setup.complexity:
+            complexity = setup.complexity
             config = Config(
                 max_implementation_attempts=complexity.recommended_attempts,
                 max_review_cycles=config.max_review_cycles,
@@ -753,6 +754,7 @@ def main() -> int:
         impl_attempts, setup = implementation_phase(
             args, config, setup, logger, history, run_id, start_time,
         )
+        total_attempts = impl_attempts
 
         # Phase 3: Review (unless skipped)
         was_approved = True
@@ -781,12 +783,12 @@ def main() -> int:
     except SystemExit as exc:
         error_msg = str(exc)
         logger.fatal(error_msg)
-        history.fail_run(run_id, error_msg, total_attempts=0)
+        history.fail_run(run_id, error_msg, total_attempts=total_attempts)
         return 1
     except Exception as exc:
         error_msg = f"Unexpected error: {exc}"
         logger.fatal(error_msg)
-        history.fail_run(run_id, error_msg, total_attempts=0)
+        history.fail_run(run_id, error_msg, total_attempts=total_attempts)
         return 1
     finally:
         history.close()

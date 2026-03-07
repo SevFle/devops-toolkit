@@ -60,4 +60,8 @@ class Config:
             errors.append("claude_timeout must be >= 60 seconds")
         if self.review_timeout < 30:
             errors.append("review_timeout must be >= 30 seconds")
+        if self.time_budget_seconds <= 0:
+            errors.append("time_budget_seconds must be > 0")
+        if self.max_consecutive_no_progress < 1:
+            errors.append("max_consecutive_no_progress must be >= 1")
         return errors
