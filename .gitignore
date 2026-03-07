@@ -9,3 +9,6 @@ build/
 *.db
 .env
 .devops-toolkit/
+
+# Git worktrees
+.worktrees/
