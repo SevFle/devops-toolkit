@@ -217,7 +217,6 @@ jobs:
         id: claude
         continue-on-error: true
         if: steps.label-check.outputs.should_run == 'true' && steps.label-check.outputs.has_interview_finished_label != 'true'
-        env:
         run: |
           RESPONSE_FILE=$(mktemp)
           cat /tmp/interview-prompt.md | claude -p \
