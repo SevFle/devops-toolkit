@@ -30,9 +30,7 @@ on:
         type: string
         default: 'self-hosted'
     secrets:
-      OPENSPEC_GH_TOKEN:
-        required: true
-      ANTHROPIC_API_KEY:
+      PAT_TOKEN:
         required: true
 
 jobs:
@@ -69,8 +67,7 @@ jobs:
 
       - name: Run orchestrator
         env:
-          GITHUB_TOKEN: ${{ secrets.OPENSPEC_GH_TOKEN }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
           ORCHESTRATOR_MAX_ATTEMPTS: ${{ inputs.max_attempts }}
           ORCHESTRATOR_MAX_REVIEW_CYCLES: ${{ inputs.max_review_cycles }}
           CHANGE_NAME: ${{ inputs.change_name }}

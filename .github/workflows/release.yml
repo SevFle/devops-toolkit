@@ -41,8 +41,6 @@ on:
     secrets:
       NPM_TOKEN:
         required: false
-      ANTHROPIC_API_KEY:
-        required: false
 
 permissions:
   contents: write
@@ -95,7 +93,6 @@ jobs:
         if: inputs.generate_notes
         id: ai-notes
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail

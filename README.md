@@ -60,12 +60,11 @@ AI-driven feature implementation from issue to PR:
 | Workflow | Description | Trigger |
 |----------|-------------|---------|
 | `openspec-interview.yml` | Multi-turn interview bot on GitHub issues. Claude asks clarifying questions, tracks state in base64 comment markers, and determines when the interview is complete. | `workflow_call` |
-| `openspec-propose.yml` | Generates OpenSpec artifacts (proposal, tasks, specs) from completed interview context. Creates a structured change directory. | `workflow_call` |
 | `openspec-orchestrate.yml` | Drives Claude CLI in a retry loop to implement an OpenSpec change: creates branch, runs implementation attempts, reviews code, commits progress, and opens a PR. | `workflow_call` |
 
-### AI-Powered Analysis (Claude CLI)
+### AI-Powered Analysis
 
-All AI workflows invoke Claude CLI (`claude -p`) with specialized prompts and parse structured JSON output.
+All AI workflows invoke an AI CLI with specialized prompts and parse structured JSON output. By default they use Claude CLI (`claude -p`), but can be switched to OpenCode (`opencode -p`) via the `ai_cli` input on any workflow.
 
 | Workflow | Description | Trigger |
 |----------|-------------|---------|
@@ -309,6 +308,18 @@ jobs:
     secrets: inherit
 ```
 
+### AI Code Review (with OpenCode)
+
+```yaml
+jobs:
+  review:
+    uses: SevFle/devops-toolkit/.github/workflows/ai-code-review.yml@main
+    with:
+      ai_cli: opencode
+      ai_model: 'your-model-id'
+    secrets: inherit
+```
+
 ### OWASP Security Audit
 
 ```yaml
@@ -364,9 +375,7 @@ jobs:
 
 | Secret | Used By | Description |
 |--------|---------|-------------|
-| `ANTHROPIC_API_KEY` | AI workflows, OpenSpec, CI-Heal | Claude API key |
-| `PAT_TOKEN` | CI-Heal | GitHub PAT with repo + workflow permissions |
-| `OPENSPEC_GH_TOKEN` | OpenSpec | GitHub PAT for branch/PR creation |
+| `PAT_TOKEN` | CI-Heal, OpenSpec | GitHub PAT with repo + workflow permissions |
 | `DEPLOY_HOST` | VPS Deploy | VPS hostname |
 | `DEPLOY_USER` | VPS Deploy | SSH username |
 | `DEPLOY_SSH_KEY` | VPS Deploy | SSH private key |
@@ -393,7 +402,6 @@ jobs:
   ci-heal.yml               # Auto-fix CI failures with Claude
   housekeeping.yml          # Stale issue/PR/branch cleanup
   openspec-interview.yml    # AI interview bot on issues
-  openspec-propose.yml      # Generate OpenSpec artifacts
   openspec-orchestrate.yml  # AI-driven implementation loop
   ai-owasp-audit.yml        # OWASP Top 20 security audit
   ai-code-review.yml        # AI PR code review

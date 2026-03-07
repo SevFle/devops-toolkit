@@ -406,20 +406,6 @@ jobs:
 OIEOF
     ok "Created .github/workflows/openspec-interview.yml"
 
-    cat > .github/workflows/openspec-propose.yml << OPEOF
-name: OpenSpec Propose
-on:
-  issue_comment:
-    types: [created]
-jobs:
-  propose:
-    uses: ${TOOLKIT_REPO}/.github/workflows/openspec-propose.yml@${TOOLKIT_REF}
-    with:
-      base_branch: ${base_branch}
-    secrets: inherit
-OPEOF
-    ok "Created .github/workflows/openspec-propose.yml"
-
     cat > .github/workflows/openspec-orchestrate.yml << OOEOF
 name: OpenSpec Orchestrate
 on:
@@ -449,15 +435,11 @@ OOEOF
   echo "  2. Configure required secrets in GitHub Settings > Secrets:"
   echo ""
 
-  if [ "$enable_ci_heal" = "true" ]; then
+  if [ "$enable_ci_heal" = "true" ] || [ "$enable_openspec" = "true" ]; then
     echo "     - PAT_TOKEN (GitHub PAT with repo + workflow permissions)"
   fi
   if [ "$enable_deploy_staging" = "true" ] || [ "$enable_deploy_prod" = "true" ]; then
     echo "     - DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_PORT"
-  fi
-  if [ "$enable_openspec" = "true" ]; then
-    echo "     - ANTHROPIC_API_KEY (Claude API key)"
-    echo "     - OPENSPEC_GH_TOKEN (GitHub PAT for branch/PR creation)"
   fi
 
   echo ""

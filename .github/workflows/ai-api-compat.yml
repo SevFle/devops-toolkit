@@ -3,10 +3,14 @@ name: AI API Breaking Change Detection
 on:
   workflow_call:
     inputs:
+      ai_cli:
+        type: string
+        default: 'claude'
+        description: 'AI CLI to use: claude or opencode'
       ai_model:
         type: string
         default: 'claude-sonnet-4-5-20250514'
-        description: 'Claude model for analysis'
+        description: 'AI model for analysis'
       api_type:
         type: string
         default: 'auto'
@@ -18,9 +22,7 @@ on:
       runners:
         type: string
         default: 'self-hosted'
-    secrets:
-      ANTHROPIC_API_KEY:
-        required: true
+    secrets: {}
 
 permissions:
   pull-requests: write
@@ -149,20 +151,25 @@ jobs:
 
           echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Run Claude
+      - name: Run AI
         id: claude
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_CLI: ${{ inputs.ai_cli }}
+          AI_MODEL: ${{ inputs.ai_model }}
         run: |
           set -euo pipefail
 
           RESPONSE_FILE=$(mktemp /tmp/api-compat-response-XXXXXX.txt)
 
-          cat "${{ steps.prompt.outputs.prompt_file }}" | claude -p \
-            --model "${{ inputs.ai_model }}" \
-            --max-turns 1 \
-            --allowedTools "" \
-            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+          run_ai() {
+            if [ "$AI_CLI" = "opencode" ]; then
+              opencode -p --model "$AI_MODEL" --max-turns 1 --output-format text
+            else
+              claude -p --model "$AI_MODEL" --max-turns 1 --allowedTools "" --output-format text
+            fi
+          }
+
+          cat "${{ steps.prompt.outputs.prompt_file }}" | run_ai > "$RESPONSE_FILE" 2>&1 || true
 
           echo "response_file=$RESPONSE_FILE" >> "$GITHUB_OUTPUT"
 

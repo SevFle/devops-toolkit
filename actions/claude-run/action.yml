@@ -95,8 +95,6 @@ runs:
     - name: Run Claude
       id: run
       shell: bash
-      env:
-        ANTHROPIC_API_KEY: ${{ env.ANTHROPIC_API_KEY }}
       run: |
         RESPONSE_FILE=$(mktemp /tmp/claude-response-XXXXXX.txt)
 

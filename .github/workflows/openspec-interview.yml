@@ -18,9 +18,7 @@ on:
       runners:
         type: string
         default: 'self-hosted'
-    secrets:
-      ANTHROPIC_API_KEY:
-        required: true
+    secrets: {}
 
 concurrency:
   group: openspec-interview-${{ github.event.issue.number || github.event.comment.issue_url || github.event.inputs.issue_number }}
@@ -221,7 +219,6 @@ jobs:
         continue-on-error: true
         if: steps.label-check.outputs.should_run == 'true' && steps.label-check.outputs.has_interview_finished_label != 'true'
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           RESPONSE_FILE=$(mktemp)
           cat /tmp/interview-prompt.md | claude -p \

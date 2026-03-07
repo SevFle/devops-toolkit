@@ -3,10 +3,14 @@ name: OWASP Top 20 Security Audit
 on:
   workflow_call:
     inputs:
+      ai_cli:
+        type: string
+        default: 'claude'
+        description: 'AI CLI to use: claude or opencode'
       ai_model:
         type: string
         default: 'claude-sonnet-4-5-20250514'
-        description: 'Claude model for audit'
+        description: 'AI model for audit'
       categories:
         type: string
         default: 'all'
@@ -22,9 +26,7 @@ on:
       runners:
         type: string
         default: 'self-hosted'
-    secrets:
-      ANTHROPIC_API_KEY:
-        required: true
+    secrets: {}
 
 permissions:
   issues: write
@@ -108,20 +110,24 @@ jobs:
             done
           } >> /tmp/audit-prompt.md
 
-      - name: Run Claude OWASP Audit
+      - name: Run AI OWASP Audit
         id: claude
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           AI_MODEL: ${{ inputs.ai_model }}
+          AI_CLI: ${{ inputs.ai_cli }}
         run: |
           set -euo pipefail
           RESPONSE_FILE=$(mktemp)
 
-          cat /tmp/audit-prompt.md | claude -p \
-            --model "$AI_MODEL" \
-            --max-turns 1 \
-            --allowedTools "" \
-            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+          run_ai() {
+            if [ "$AI_CLI" = "opencode" ]; then
+              opencode -p --model "$AI_MODEL" --max-turns 1 --output-format text
+            else
+              claude -p --model "$AI_MODEL" --max-turns 1 --allowedTools "" --output-format text
+            fi
+          }
+
+          cat /tmp/audit-prompt.md | run_ai > "$RESPONSE_FILE" 2>&1 || true
 
           # Extract JSON block
           JSON_FILE=$(mktemp)
