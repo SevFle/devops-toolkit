@@ -37,6 +37,8 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Run quality checks
         id: checks
@@ -45,6 +47,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BRANCH: ${{ github.head_ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           MAX_LINES_WARN: ${{ inputs.max_lines_warn }}
           MAX_LINES_BLOCK: ${{ inputs.max_lines_block }}
           REQUIRE_CONVENTIONAL: ${{ inputs.require_conventional_commits }}
@@ -57,7 +60,8 @@ jobs:
           COMMENT="## PR Quality Gate Results\n\n| Check | Status | Details |\n|-------|--------|---------|"
 
           # --- Diff size check ---
-          DIFF_STAT=$(gh pr diff "$PR_NUMBER" --stat | tail -1)
+          git fetch origin "$BASE_REF" --depth=1 2>/dev/null || true
+          DIFF_STAT=$(git diff --stat "origin/${BASE_REF}...HEAD" 2>/dev/null | tail -1 || echo "0 files changed")
           TOTAL_LINES=$(echo "$DIFF_STAT" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo 0)
           DELETED_LINES=$(echo "$DIFF_STAT" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo 0)
           CHANGED=$((TOTAL_LINES + DELETED_LINES))

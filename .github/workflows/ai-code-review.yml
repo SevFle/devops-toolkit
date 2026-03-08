@@ -35,10 +35,15 @@ jobs:
   code-review:
     runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
     steps:
+      - name: Clean stale devops-toolkit directory
+        run: rm -rf .devops-toolkit
+        continue-on-error: true
+
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          submodules: false
 
       - name: Checkout devops-toolkit for prompts
         uses: actions/checkout@v6
@@ -46,6 +51,15 @@ jobs:
           repository: SevFle/devops-toolkit
           path: .devops-toolkit
           ref: main
+
+      - name: Verify devops-toolkit checkout
+        run: |
+          if [ ! -f ".devops-toolkit/prompts/ai-code-review.prompt.md" ]; then
+            echo "::warning::Prompt file missing, listing .devops-toolkit contents:"
+            ls -la .devops-toolkit/ 2>/dev/null || echo "Directory does not exist"
+            ls -la .devops-toolkit/prompts/ 2>/dev/null || echo "Prompts directory does not exist"
+            exit 1
+          fi
 
       - name: Get PR diff
         id: diff

@@ -32,10 +32,22 @@ jobs:
     name: API Compatibility Check
     runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
     steps:
+      - name: Clean stale devops-toolkit directory
+        run: rm -rf .devops-toolkit
+        continue-on-error: true
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          submodules: false
+
+      - name: Checkout devops-toolkit for prompts
+        uses: actions/checkout@v6
+        with:
+          repository: SevFle/devops-toolkit
+          path: .devops-toolkit
+          ref: main
 
       - name: Extract API surface from base branch
         id: base-api
