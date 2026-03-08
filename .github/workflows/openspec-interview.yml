@@ -213,30 +213,24 @@ jobs:
             printf 'Ask in the SAME LANGUAGE as the issue.\n'
           } >> /tmp/interview-prompt.md
 
+      - name: Encode interview prompt
+        id: prompt-encode
+        if: steps.label-check.outputs.should_run == 'true' && steps.label-check.outputs.has_interview_finished_label != 'true'
+        run: |
+          echo "prompt_b64=$(base64 -w0 /tmp/interview-prompt.md)" >> $GITHUB_OUTPUT
+
       - name: Run Interview Agent
         id: claude
         continue-on-error: true
         if: steps.label-check.outputs.should_run == 'true' && steps.label-check.outputs.has_interview_finished_label != 'true'
+        uses: ./.devops-toolkit/actions/opencode-run
         env:
-          AI_MODEL: ${{ inputs.ai_model }}
-        run: |
-          RESPONSE_FILE=$(mktemp)
-          PROMPT=$(cat /tmp/interview-prompt.md)
-          opencode run -m "$AI_MODEL" "$PROMPT" > "$RESPONSE_FILE" 2>&1 || true
-          RESPONSE=$(cat "$RESPONSE_FILE")
-          QUESTION_STEP=$(echo "$RESPONSE" | grep -oP 'OPENSPEC_QUESTION_STEP:\s*\K\d+' | head -1 || true)
-          echo "question_step=$QUESTION_STEP" >> $GITHUB_OUTPUT
-          QUESTION_CONTENT=$(echo "$RESPONSE" | sed -n 's/^OPENSPEC_QUESTION:\s*//p' | head -1 || true)
-          echo "question_content=$QUESTION_CONTENT" >> $GITHUB_OUTPUT
-          INTERVIEW_COMPLETE=$(echo "$RESPONSE" | grep -oP 'OPENSPEC_INTERVIEW_COMPLETE:\s*\K(true|false)' | head -1 || true)
-          echo "interview_complete=$INTERVIEW_COMPLETE" >> $GITHUB_OUTPUT
-          EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 2>/dev/null | base64)
-          {
-            echo "response<<${EOF_MARKER}"
-            head -c 900000 "$RESPONSE_FILE"
-            echo "${EOF_MARKER}"
-          } >> $GITHUB_OUTPUT
-          rm -f "$RESPONSE_FILE"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: ${{ inputs.ai_model }}
+          use_github_token: "true"
+          prompt: ${{ steps.prompt-encode.outputs.prompt_b64 }}
+          is_encoded: "true"
 
       - name: Post formatted interview question
         if: steps.label-check.outputs.should_run == 'true' && steps.label-check.outputs.has_interview_finished_label != 'true'

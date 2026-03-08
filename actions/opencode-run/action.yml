@@ -1,0 +1,440 @@
+name: "Run OpenCode and capture response output"
+description: "Wraps opencode run with reliable stdout capture and structured output parsing"
+branding:
+  icon: "code"
+  color: "orange"
+
+inputs:
+  model:
+    description: "Model to use (provider/model format)"
+    required: true
+
+  agent:
+    description: "Agent to use"
+    required: false
+
+  prompt:
+    description: "Custom prompt (ignored when prompt_file is set)"
+    required: false
+  prompt_file:
+    description: "Path to prompt file (avoids ARG_MAX; used instead of prompt when set)"
+    required: false
+
+  use_github_token:
+    description: "Use GITHUB_TOKEN directly"
+    required: false
+    default: "false"
+
+  mentions:
+    description: "Comma-separated list of trigger phrases"
+    required: false
+
+  is_encoded:
+    description: "If 'true', prompt is base64-encoded and will be decoded"
+    required: false
+    default: "false"
+
+  timeout:
+    description: "Timeout in seconds"
+    required: false
+    default: "1200"
+
+outputs:
+  response:
+    description: "Full stdout output from opencode run"
+    value: ${{ steps.run_opencode.outputs.response }}
+  question_content:
+    description: "Structured OpenSpec question content"
+    value: ${{ steps.run_opencode.outputs.question_content }}
+  question_step:
+    description: "Structured OpenSpec question step"
+    value: ${{ steps.run_opencode.outputs.question_step }}
+  change_id:
+    description: "Structured OpenSpec change id"
+    value: ${{ steps.run_opencode.outputs.change_id }}
+  interview_complete:
+    description: "Structured OpenSpec interview completion flag"
+    value: ${{ steps.run_opencode.outputs.interview_complete }}
+  write_operations:
+    description: "JSON array of Write tool operations extracted from opencode output"
+    value: ${{ steps.run_opencode.outputs.write_operations }}
+  json_output_file:
+    description: "Path to file containing raw JSON output from opencode"
+    value: ${{ steps.run_opencode.outputs.json_output_file }}
+  schema_valid:
+    description: "Whether the agent output passed schema validation"
+    value: ${{ steps.run_opencode.outputs.schema_valid }}
+  validation_errors:
+    description: "Schema validation errors if any"
+    value: ${{ steps.run_opencode.outputs.validation_errors }}
+  has_question_markers:
+    description: "Whether interview question markers were found"
+    value: ${{ steps.run_opencode.outputs.has_question_markers }}
+  has_proposal_markers:
+    description: "Whether proposal markers were found"
+    value: ${{ steps.run_opencode.outputs.has_proposal_markers }}
+  extraction_method:
+    description: "Method used to extract markers (json or legacy)"
+    value: ${{ steps.run_opencode.outputs.extraction_method }}
+  agent_error:
+    description: "Error code from agent if it returned an error response"
+    value: ${{ steps.run_opencode.outputs.agent_error }}
+  agent_error_reason:
+    description: "Error reason/message from agent if it returned an error response"
+    value: ${{ steps.run_opencode.outputs.agent_error_reason }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install opencode
+      shell: bash
+      run: |
+        if ! command -v opencode &> /dev/null; then
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> $GITHUB_PATH
+        fi
+
+    - name: Run opencode and capture response
+      id: run_opencode
+      shell: bash
+      env:
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_AGENT: ${{ inputs.agent }}
+        INPUT_USE_GITHUB_TOKEN: ${{ inputs.use_github_token }}
+        INPUT_MENTIONS: ${{ inputs.mentions }}
+        INPUT_PROMPT: ${{ inputs.prompt }}
+        INPUT_PROMPT_FILE: ${{ inputs.prompt_file }}
+        INPUT_IS_ENCODED: ${{ inputs.is_encoded }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        set -x
+
+        # Disable snapshots to ensure file changes persist to the real filesystem
+        export OPENCODE_CONFIG_CONTENT='{"snapshot": false}'
+
+        # Resolve prompt
+        if [ -n "$INPUT_PROMPT_FILE" ] && [ -f "$INPUT_PROMPT_FILE" ]; then
+          PROMPT_FILE="$INPUT_PROMPT_FILE"
+        else
+          if [ -z "$INPUT_PROMPT" ]; then
+            echo "::error::Either prompt or prompt_file must be provided"
+            exit 1
+          fi
+          PROMPT_FILE=$(mktemp)
+          if [ "$INPUT_IS_ENCODED" = "true" ]; then
+            echo "$INPUT_PROMPT" | base64 -d > "$PROMPT_FILE"
+          else
+            printf '%s' "$INPUT_PROMPT" > "$PROMPT_FILE"
+          fi
+        fi
+
+        echo "::group::Environment"
+        echo "MODEL=$INPUT_MODEL"
+        echo "AGENT=$INPUT_AGENT"
+        opencode --version || echo "Failed to get opencode version"
+        echo "::endgroup::"
+
+        echo "::group::opencode run"
+
+        TEMP_OUTPUT=$(mktemp)
+        JSON_OUTPUT="${RUNNER_TEMP:-/tmp}/opencode_json_output_$$.jsonl"
+        trap "rm -f $TEMP_OUTPUT; kill -9 $PID 2>/dev/null || true" EXIT
+
+        cat "$PROMPT_FILE" | opencode run --model "$INPUT_MODEL" --format json \
+          > "$JSON_OUTPUT" 2>&1 &
+        PID=$!
+
+        TIMEOUT="${INPUT_TIMEOUT:-1200}"
+        ELAPSED=0
+        while kill -0 $PID 2>/dev/null; do
+          sleep 1
+          ELAPSED=$((ELAPSED + 1))
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "Error: opencode run timed out after ${TIMEOUT}s"
+            kill -9 $PID 2>/dev/null || true
+            exit 1
+          fi
+        done
+
+        set +e
+        wait $PID
+        EXIT_CODE=$?
+        set -e
+
+        cp "$JSON_OUTPUT" "$TEMP_OUTPUT"
+        RESPONSE=$(cat "$TEMP_OUTPUT")
+
+        echo "Exit code: $EXIT_CODE"
+        echo "Response length: ${#RESPONSE}"
+
+        if [ $EXIT_CODE -ne 0 ]; then
+          echo "::error::opencode run failed with exit code $EXIT_CODE"
+          echo "::group::Full error output"
+          cat "$TEMP_OUTPUT"
+          echo "::endgroup::"
+        fi
+
+        TRIMMED_RESPONSE=$(echo "$RESPONSE" | tr -d '\n\r\t ')
+        if [ -z "$TRIMMED_RESPONSE" ] && [ $EXIT_CODE -eq 0 ]; then
+          echo "Error: opencode returned empty response"
+          exit 1
+        fi
+
+        echo "response<<OPENCODERESPONSEEOFDELIMITER" >> $GITHUB_OUTPUT
+        echo "$RESPONSE" >> $GITHUB_OUTPUT
+        echo "OPENCODERESPONSEEOFDELIMITER" >> $GITHUB_OUTPUT
+
+        # Extract plain text from JSONL output
+        TEXT_CONTENT=$(grep -E '^\{' "$JSON_OUTPUT" | jq -rs '
+          [.[] |
+            if .type == "text" then (.part.text // .text // "")
+            elif .part?.text then .part.text
+            elif .type == "content_block_delta" and .part?.delta?.text then .part.delta.text
+            elif .type == "message_delta" then .part?.delta?.text // empty
+            else empty
+            end
+          ] | join("")
+        ' 2>/dev/null || echo "")
+
+        if [ -z "$TEXT_CONTENT" ]; then
+          TEXT_CONTENT="$RESPONSE"
+        fi
+
+        TEXT_CONTENT=$(printf '%s' "$TEXT_CONTENT" | sed 's/\\n/\n/g')
+
+        # Initialize extraction variables
+        QUESTION_STEP=""
+        CHANGE_ID=""
+        INTERVIEW_COMPLETE=""
+        QUESTION_CONTENT=""
+        EXTRACTION_METHOD="none"
+        AGENT_ERROR=""
+        AGENT_ERROR_REASON=""
+
+        # STRATEGY 1: JSON parsing (new format)
+        JSON_EXTRACTED=""
+
+        # Method 0: Extract from markdown code fence
+        if echo "$TEXT_CONTENT" | grep -q '```json'; then
+          JSON_EXTRACTED=$(echo "$TEXT_CONTENT" | sed -n '/^```json$/,/^```$/p' | sed '1d;$d' | tr -d '\r' | jq -ec 'if .step or .error then . else empty end' 2>/dev/null || echo "")
+        fi
+
+        # Method 1: Simple JSON object extraction
+        if [ -z "$JSON_EXTRACTED" ]; then
+          POTENTIAL_JSON=$(echo "$TEXT_CONTENT" | grep -oE '\{[^{}]*\}' | head -10 || echo "")
+          while IFS= read -r candidate; do
+            if [ -n "$candidate" ]; then
+              if echo "$candidate" | jq -e '.step or .error' >/dev/null 2>&1; then
+                JSON_EXTRACTED="$candidate"
+                break
+              fi
+            fi
+          done <<< "$POTENTIAL_JSON"
+        fi
+
+        # Method 2: Perl balanced brace extraction
+        if [ -z "$JSON_EXTRACTED" ] && command -v perl >/dev/null 2>&1; then
+          JSON_EXTRACTED=$(echo "$TEXT_CONTENT" | perl -0777 -ne 'while (/(\{(?:[^{}]|(?:\{(?:[^{}]|\{[^{}]*\})*\}))*\})/g) { print "$1\n"; }' | while read -r candidate; do
+            if echo "$candidate" | jq -e '.step or .error' >/dev/null 2>&1; then
+              echo "$candidate"
+              break
+            fi
+          done || echo "")
+        fi
+
+        # Method 3: Normalized single-depth
+        if [ -z "$JSON_EXTRACTED" ]; then
+          TEXT_NORMALIZED=$(echo "$TEXT_CONTENT" | tr '\n' ' ' | tr '\r' ' ')
+          JSON_EXTRACTED=$(echo "$TEXT_NORMALIZED" | grep -oE '\{[^{}]*"step"[^{}]*\}' | head -1 || echo "")
+        fi
+
+        # Method 4: Error pattern
+        if [ -z "$JSON_EXTRACTED" ]; then
+          TEXT_NORMALIZED=$(echo "$TEXT_CONTENT" | tr '\n' ' ' | tr '\r' ' ')
+          JSON_EXTRACTED=$(echo "$TEXT_NORMALIZED" | grep -oE '\{[^{}]*"error"[^{}]*\}' | head -1 || echo "")
+        fi
+
+        if [ -n "$JSON_EXTRACTED" ] && echo "$JSON_EXTRACTED" | jq -e . >/dev/null 2>&1; then
+          EXTRACTION_METHOD="json"
+          echo "Detected JSON output format from agent"
+
+          JSON_STEP=$(echo "$JSON_EXTRACTED" | jq -r '.step // empty' 2>/dev/null || echo "")
+          JSON_QUESTION=$(echo "$JSON_EXTRACTED" | jq -r '.question // empty' 2>/dev/null || echo "")
+          JSON_EXAMPLE=$(echo "$JSON_EXTRACTED" | jq -r '.example_answer // .example // empty' 2>/dev/null || echo "")
+          JSON_COMPLETE=$(echo "$JSON_EXTRACTED" | jq -r '.is_complete // empty' 2>/dev/null || echo "")
+          JSON_ERROR=$(echo "$JSON_EXTRACTED" | jq -r '.error // empty' 2>/dev/null || echo "")
+          JSON_ERROR_REASON=$(echo "$JSON_EXTRACTED" | jq -r '.reason // empty' 2>/dev/null || echo "")
+          JSON_STOP=$(echo "$JSON_EXTRACTED" | jq -r '.stop_interview // .stop // empty' 2>/dev/null || echo "")
+
+          if [ -n "$JSON_ERROR" ]; then
+            AGENT_ERROR="$JSON_ERROR"
+            AGENT_ERROR_REASON="$JSON_ERROR_REASON"
+            echo "::error::Agent returned error: $JSON_ERROR - $JSON_ERROR_REASON"
+            if [ "$JSON_STOP" = "true" ]; then
+              INTERVIEW_COMPLETE="true"
+            fi
+          fi
+
+          if [ -n "$JSON_STEP" ]; then
+            QUESTION_STEP="$JSON_STEP"
+          fi
+
+          if [ -n "$JSON_QUESTION" ]; then
+            if [ -n "$JSON_EXAMPLE" ]; then
+              QUESTION_CONTENT=$(printf '%s\n\nFor example: %s' "$JSON_QUESTION" "$JSON_EXAMPLE")
+            else
+              QUESTION_CONTENT="$JSON_QUESTION"
+            fi
+          fi
+
+          if [ "$JSON_COMPLETE" = "true" ]; then
+            INTERVIEW_COMPLETE="true"
+          elif [ "$JSON_COMPLETE" = "false" ]; then
+            INTERVIEW_COMPLETE="false"
+          fi
+        fi
+
+        # STRATEGY 2: Legacy OPENSPEC_ marker parsing
+        if [ "$EXTRACTION_METHOD" = "none" ]; then
+          echo "Falling back to legacy OPENSPEC_ marker extraction"
+          EXTRACTION_METHOD="legacy"
+
+          QUESTION_STEP=$(echo "$TEXT_CONTENT" | grep -oE 'OPENSPEC_QUESTION_STEP:[[:space:]]*[0-9]+' | head -1 | sed 's/OPENSPEC_QUESTION_STEP:[[:space:]]*//' || echo "")
+          CHANGE_ID=$(echo "$TEXT_CONTENT" | grep -oE 'OPENSPEC_CHANGE_ID:[[:space:]]*[-a-z0-9]+' | tail -1 | sed 's/OPENSPEC_CHANGE_ID:[[:space:]]*//' || echo "")
+          INTERVIEW_COMPLETE=$(echo "$TEXT_CONTENT" | grep -oE 'OPENSPEC_INTERVIEW_COMPLETE:[[:space:]]*(true|false)' | tail -1 | sed 's/OPENSPEC_INTERVIEW_COMPLETE:[[:space:]]*//' || echo "")
+
+          QUESTION_CONTENT=$(echo "$TEXT_CONTENT" | awk '
+            /^OPENSPEC_QUESTION:/{flag=1;next}
+            /^OPENSPEC_[A-Z_]+:/{if(flag){exit}}
+            flag{print}
+          ' || true)
+
+          if [ -n "$QUESTION_CONTENT" ]; then
+            QUESTION_CONTENT=$(printf "%s" "$QUESTION_CONTENT" | sed '1{/^```/d};${/^```/d}')
+          fi
+        fi
+
+        # STRATEGY 3: Supplement JSON with legacy markers for missing fields
+        if [ "$EXTRACTION_METHOD" = "json" ]; then
+          if [ -z "$QUESTION_STEP" ]; then
+            LEGACY_STEP=$(echo "$TEXT_CONTENT" | grep -oE 'OPENSPEC_QUESTION_STEP:[[:space:]]*[0-9]+' | head -1 | sed 's/OPENSPEC_QUESTION_STEP:[[:space:]]*//' || echo "")
+            if [ -n "$LEGACY_STEP" ]; then
+              QUESTION_STEP="$LEGACY_STEP"
+              EXTRACTION_METHOD="json+legacy"
+            fi
+          fi
+
+          if [ -z "$QUESTION_CONTENT" ]; then
+            LEGACY_CONTENT=$(echo "$TEXT_CONTENT" | awk '
+              /^OPENSPEC_QUESTION:/{flag=1;next}
+              /^OPENSPEC_[A-Z_]+:/{if(flag){exit}}
+              flag{print}
+            ' || true)
+            if [ -n "$LEGACY_CONTENT" ]; then
+              QUESTION_CONTENT=$(printf "%s" "$LEGACY_CONTENT" | sed '1{/^```/d};${/^```/d}')
+              EXTRACTION_METHOD="json+legacy"
+            fi
+          fi
+
+          if [ -z "$INTERVIEW_COMPLETE" ]; then
+            LEGACY_COMPLETE=$(echo "$TEXT_CONTENT" | grep -oE 'OPENSPEC_INTERVIEW_COMPLETE:[[:space:]]*(true|false)' | tail -1 | sed 's/OPENSPEC_INTERVIEW_COMPLETE:[[:space:]]*//' || echo "")
+            if [ -n "$LEGACY_COMPLETE" ]; then
+              INTERVIEW_COMPLETE="$LEGACY_COMPLETE"
+              EXTRACTION_METHOD="json+legacy"
+            fi
+          fi
+        fi
+
+        # Extract CHANGE_ID from legacy markers or write tool paths
+        if [ -z "$CHANGE_ID" ]; then
+          CHANGE_ID=$(echo "$TEXT_CONTENT" | grep -oE 'OPENSPEC_CHANGE_ID:[[:space:]]*[-a-z0-9]+' | tail -1 | sed 's/OPENSPEC_CHANGE_ID:[[:space:]]*//' || echo "")
+        fi
+
+        if [ -z "$CHANGE_ID" ]; then
+          while IFS= read -r line; do
+            path=$(echo "$line" | jq -r 'select(.type == "tool_use" and .part.tool == "write") | .part.state.input.filePath // empty' 2>/dev/null)
+            if [ -n "$path" ] && echo "$path" | grep -qE '^openspec/changes/[a-z][a-z0-9-]{2,49}/'; then
+              CHANGE_ID=$(echo "$path" | sed -E 's|^openspec/changes/([a-z][a-z0-9-]{2,49})/.*|\1|')
+              break
+            fi
+          done < <(grep -E '^\{' "$JSON_OUTPUT" 2>/dev/null || true)
+        fi
+
+        echo "Extraction method: $EXTRACTION_METHOD"
+
+        # Schema validation
+        VALIDATION_ERRORS=""
+        SCHEMA_VALID="true"
+        HAS_QUESTION_MARKERS="false"
+        HAS_PROPOSAL_MARKERS="false"
+
+        if [ -n "$QUESTION_STEP" ]; then
+          if ! echo "$QUESTION_STEP" | grep -qE '^[1-9][0-9]*$'; then
+            VALIDATION_ERRORS="${VALIDATION_ERRORS}Invalid OPENSPEC_QUESTION_STEP: '$QUESTION_STEP' (must be positive integer)\n"
+          else
+            HAS_QUESTION_MARKERS="true"
+          fi
+        fi
+
+        if [ -n "$CHANGE_ID" ]; then
+          if ! echo "$CHANGE_ID" | grep -qE '^[a-z][-a-z0-9]{2,49}$'; then
+            VALIDATION_ERRORS="${VALIDATION_ERRORS}Invalid OPENSPEC_CHANGE_ID: '$CHANGE_ID' (must match ^[a-z][-a-z0-9]{2,49}$)\n"
+          else
+            HAS_PROPOSAL_MARKERS="true"
+          fi
+        fi
+
+        if [ -n "$INTERVIEW_COMPLETE" ]; then
+          if [ "$INTERVIEW_COMPLETE" != "true" ] && [ "$INTERVIEW_COMPLETE" != "false" ]; then
+            VALIDATION_ERRORS="${VALIDATION_ERRORS}Invalid OPENSPEC_INTERVIEW_COMPLETE: '$INTERVIEW_COMPLETE' (must be true or false)\n"
+          fi
+        fi
+
+        if [ -n "$VALIDATION_ERRORS" ]; then
+          SCHEMA_VALID="false"
+          echo "::warning::Agent output schema validation errors:"
+          printf "$VALIDATION_ERRORS"
+          echo "validation_errors<<VALIDATIONERRORSEOF" >> $GITHUB_OUTPUT
+          printf "$VALIDATION_ERRORS" >> $GITHUB_OUTPUT
+          echo "VALIDATIONERRORSEOF" >> $GITHUB_OUTPUT
+        else
+          echo "validation_errors=" >> $GITHUB_OUTPUT
+        fi
+
+        echo "schema_valid=$SCHEMA_VALID" >> $GITHUB_OUTPUT
+        echo "has_question_markers=$HAS_QUESTION_MARKERS" >> $GITHUB_OUTPUT
+        echo "has_proposal_markers=$HAS_PROPOSAL_MARKERS" >> $GITHUB_OUTPUT
+        echo "extraction_method=$EXTRACTION_METHOD" >> $GITHUB_OUTPUT
+        echo "agent_error=$AGENT_ERROR" >> $GITHUB_OUTPUT
+        echo "agent_error_reason=$AGENT_ERROR_REASON" >> $GITHUB_OUTPUT
+
+        if [ -z "$VALIDATION_ERRORS" ]; then
+          echo "question_step=$QUESTION_STEP" >> $GITHUB_OUTPUT
+          echo "change_id=$CHANGE_ID" >> $GITHUB_OUTPUT
+          echo "interview_complete=$INTERVIEW_COMPLETE" >> $GITHUB_OUTPUT
+          echo "question_content<<OPENCODEQUESTIONEOF" >> $GITHUB_OUTPUT
+          echo "$QUESTION_CONTENT" >> $GITHUB_OUTPUT
+          echo "OPENCODEQUESTIONEOF" >> $GITHUB_OUTPUT
+        else
+          echo "::warning::Outputting empty markers due to validation errors"
+          echo "question_step=" >> $GITHUB_OUTPUT
+          echo "change_id=" >> $GITHUB_OUTPUT
+          echo "interview_complete=" >> $GITHUB_OUTPUT
+          echo "question_content=" >> $GITHUB_OUTPUT
+        fi
+
+        # Extract Write tool operations
+        WRITE_OPS=$(grep -E '^\{' "$JSON_OUTPUT" | jq -sc '[.[] | select(.type == "tool_use" and .part.tool == "write") | {filePath: .part.state.input.filePath, content: .part.state.input.content}]' 2>/dev/null || echo "[]")
+
+        echo "write_operations<<OPENCODEWRITEOPSEOF" >> $GITHUB_OUTPUT
+        echo "$WRITE_OPS" >> $GITHUB_OUTPUT
+        echo "OPENCODEWRITEOPSEOF" >> $GITHUB_OUTPUT
+
+        echo "json_output_file=$JSON_OUTPUT" >> $GITHUB_OUTPUT
+        echo "Extracted $(echo "$WRITE_OPS" | jq 'length' 2>/dev/null || echo 0) write operations"
+
+        echo "::endgroup::"
+
+        if [ $EXIT_CODE -ne 0 ]; then
+          exit 1
+        fi
