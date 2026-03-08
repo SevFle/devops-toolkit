@@ -104,10 +104,10 @@ jobs:
 
           {
             printf '\n---\n\n## PR Information\n\n'
-            printf '- **Repository:** %s\n' "$REPO"
-            printf '- **PR:** #%s\n' "$PR_NUMBER"
-            printf '- **Title:** %s\n' "$PR_TITLE"
-            printf '- **Author:** %s\n\n' "$PR_AUTHOR"
+            printf -- '- **Repository:** %s\n' "$REPO"
+            printf -- '- **PR:** #%s\n' "$PR_NUMBER"
+            printf -- '- **Title:** %s\n' "$PR_TITLE"
+            printf -- '- **Author:** %s\n\n' "$PR_AUTHOR"
             printf '## Diff\n\n```diff\n'
             cat "$DIFF_FILE"
             printf '\n```\n'
