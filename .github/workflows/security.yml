@@ -32,6 +32,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Clean stale gitleaks artifacts
+        run: rm -f /tmp/gitleaks.tmp /tmp/gitleaks-*.tar.gz
+        continue-on-error: true
+
       - name: Run Gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
