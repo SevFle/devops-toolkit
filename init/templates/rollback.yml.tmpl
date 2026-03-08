@@ -1,0 +1,26 @@
+name: Rollback
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (staging or production)'
+        required: true
+        default: 'staging'
+      reason:
+        description: 'Reason for rollback'
+        required: true
+      target_commit:
+        description: 'Optional target commit SHA'
+        required: false
+jobs:
+  rollback:
+    uses: SevFle/devops-toolkit/.github/workflows/rollback.yml@main
+    with:
+      app_name: ${{ inputs.environment == 'staging' && format('{0}-beta', '{{APP_NAME}}') || format('{0}-prod', '{{APP_NAME}}') }}
+      deploy_dir_staging: /opt/services/apps/{{APP_NAME}}-beta
+      deploy_dir_production: /opt/services/apps/{{APP_NAME}}-prod
+      image_name: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+      environment: ${{ inputs.environment }}
+      target_commit: ${{ inputs.target_commit }}
+      reason: ${{ inputs.reason }}
+    secrets: inherit

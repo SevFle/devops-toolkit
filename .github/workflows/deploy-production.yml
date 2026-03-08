@@ -14,14 +14,22 @@ on:
         required: true
       version:
         type: string
-        required: true
+        required: false
+        default: ''
         description: 'Version tag for the image'
+      image_digest:
+        type: string
+        default: ''
+        description: 'Optional image digest to deploy (preferred over version tag)'
       docker_compose_path:
         type: string
         default: 'docker-compose.yml'
       health_check_wait:
         type: number
         default: 50
+      health_check_retries:
+        type: number
+        default: 6
       health_check_url:
         type: string
         default: ''
@@ -32,6 +40,22 @@ on:
       required_env_vars:
         type: string
         default: ''
+      environment_name:
+        type: string
+        default: 'production'
+        description: 'GitHub environment name for deployment protection rules'
+      pre_deploy_command:
+        type: string
+        default: ''
+        description: 'Optional command to run on the target host before deployment'
+      migrate_command:
+        type: string
+        default: ''
+        description: 'Optional migration command to run on the target host'
+      post_deploy_command:
+        type: string
+        default: ''
+        description: 'Optional command to run on the target host after deployment'
       runners:
         type: string
         default: 'self-hosted'
@@ -44,53 +68,64 @@ on:
         required: true
       DEPLOY_PORT:
         required: false
+      REGISTRY_USERNAME:
+        required: false
+      REGISTRY_PASSWORD:
+        required: false
+      NOTIFY_WEBHOOK_URL:
+        required: false
 
 jobs:
   deploy:
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
+    environment: ${{ inputs.environment_name }}
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: false
-          load: true
-          tags: ${{ inputs.image_name }}:${{ inputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Transfer image to VPS
+      - name: Resolve immutable image reference
+        id: image-ref
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p ${{ secrets.DEPLOY_PORT || 22 }} ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
-          docker save ${{ inputs.image_name }}:${{ inputs.version }} | \
-            ssh -p ${{ secrets.DEPLOY_PORT || 22 }} \
-                -i ~/.ssh/deploy_key \
-                ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
-                'docker load'
-
-      - name: Cleanup SSH key
-        if: always()
-        run: rm -f ~/.ssh/deploy_key
+          set -euo pipefail
+          if [ -n "${{ inputs.image_digest }}" ]; then
+            IMAGE_REF="${{ inputs.image_name }}@${{ inputs.image_digest }}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            IMAGE_REF="${{ inputs.image_name }}:${{ inputs.version }}"
+          else
+            echo '::error::Either version or image_digest must be provided.'
+            exit 1
+          fi
+          echo "image_ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
 
       - name: Deploy to VPS
+        id: remote-deploy
         uses: appleboy/ssh-action@v1.2.2
         env:
           ENV_VARS_CONTENT: ${{ inputs.env_vars }}
           REQUIRED_ENV_VARS: ${{ inputs.required_env_vars }}
+          IMAGE_REF: ${{ steps.image-ref.outputs.image_ref }}
+          PRE_DEPLOY_COMMAND: ${{ inputs.pre_deploy_command }}
+          MIGRATE_COMMAND: ${{ inputs.migrate_command }}
+          POST_DEPLOY_COMMAND: ${{ inputs.post_deploy_command }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          HEALTH_RETRIES: ${{ inputs.health_check_retries }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: ${{ secrets.DEPLOY_PORT || 22 }}
-          envs: ENV_VARS_CONTENT,REQUIRED_ENV_VARS
+          envs: ENV_VARS_CONTENT,REQUIRED_ENV_VARS,IMAGE_REF,PRE_DEPLOY_COMMAND,MIGRATE_COMMAND,POST_DEPLOY_COMMAND,REGISTRY_USERNAME,REGISTRY_PASSWORD,HEALTH_RETRIES
           script: |
-            set -e
+            set -euo pipefail
             cd ${{ inputs.deploy_dir }}
+
+            if [ -n "$REGISTRY_USERNAME" ] && [ -n "$REGISTRY_PASSWORD" ]; then
+              echo "$REGISTRY_PASSWORD" | docker login $(echo "$IMAGE_REF" | cut -d/ -f1) --username "$REGISTRY_USERNAME" --password-stdin
+            fi
+
+            if [ -n "$PRE_DEPLOY_COMMAND" ]; then
+              bash -lc "$PRE_DEPLOY_COMMAND"
+            fi
+
+            docker pull "$IMAGE_REF"
 
             if [ -n "$ENV_VARS_CONTENT" ]; then
               TMP_ENV=$(mktemp)
@@ -110,30 +145,95 @@ jobs:
               cat > "$TMP_OVERRIDE" <<EOF
             services:
               ${{ inputs.app_name }}:
+                image: $IMAGE_REF
                 env_file:
                   - $TMP_ENV
             EOF
-              docker compose -f ${{ inputs.docker_compose_path }} -f "$TMP_OVERRIDE" down || true
-              docker compose -f ${{ inputs.docker_compose_path }} -f "$TMP_OVERRIDE" up -d
-              sleep ${{ inputs.health_check_wait }}
-              rm -f "$TMP_OVERRIDE" "$TMP_ENV"
             else
-              docker compose -f ${{ inputs.docker_compose_path }} down || true
-              docker compose -f ${{ inputs.docker_compose_path }} up -d
-              sleep ${{ inputs.health_check_wait }}
+              TMP_OVERRIDE=$(mktemp)
+              cat > "$TMP_OVERRIDE" <<EOF
+            services:
+              ${{ inputs.app_name }}:
+                image: $IMAGE_REF
+            EOF
+              TMP_ENV=''
             fi
 
-            if docker ps | grep "${{ inputs.app_name }}" | grep -q "healthy"; then
-              echo "Deployment successful!"
-            else
-              echo "Health check failed!"
-              docker ps -a | grep "${{ inputs.app_name }}"
-              docker logs "${{ inputs.app_name }}" --tail 50
+            if [ -n "$MIGRATE_COMMAND" ]; then
+              bash -lc "$MIGRATE_COMMAND"
+            fi
+
+            docker compose -f ${{ inputs.docker_compose_path }} -f "$TMP_OVERRIDE" up -d --remove-orphans
+
+            if [ -n "$POST_DEPLOY_COMMAND" ]; then
+              bash -lc "$POST_DEPLOY_COMMAND"
+            fi
+
+            attempt=1
+            healthy='false'
+            while [ "$attempt" -le "$HEALTH_RETRIES" ]; do
+              if docker ps --filter "name=${{ inputs.app_name }}" --format '{{.Status}}' | grep -qi 'healthy'; then
+                healthy='true'
+                break
+              fi
+              if docker ps --filter "name=${{ inputs.app_name }}" --format '{{.Status}}' | grep -qi 'Up'; then
+                echo "Container is up but not healthy yet (attempt $attempt/$HEALTH_RETRIES)."
+              fi
+              sleep ${{ inputs.health_check_wait }}
+              attempt=$((attempt + 1))
+            done
+
+            rm -f "$TMP_OVERRIDE"
+            [ -n "$TMP_ENV" ] && rm -f "$TMP_ENV"
+
+            if [ "$healthy" != 'true' ]; then
+              echo 'Health check failed!'
+              docker ps -a | grep "${{ inputs.app_name }}" || true
+              docker logs "${{ inputs.app_name }}" --tail 100 || true
               exit 1
             fi
+
+            echo 'Deployment successful!'
 
       - name: External health check
         if: inputs.health_check_url != ''
         run: |
-          sleep 10
-          curl -f "${{ inputs.health_check_url }}" || exit 1
+          set -euo pipefail
+          attempt=1
+          until [ "$attempt" -gt "${{ inputs.health_check_retries }}" ]; do
+            if curl -fsSL "${{ inputs.health_check_url }}" >/dev/null; then
+              exit 0
+            fi
+            sleep 10
+            attempt=$((attempt + 1))
+          done
+          echo '::error::External health check failed'
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          echo '## Production Deployment' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Environment:** ${{ inputs.environment_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image:** ${{ steps.image-ref.outputs.image_ref }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Status:** ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify webhook
+        if: always() && secrets.NOTIFY_WEBHOOK_URL != ''
+        env:
+          WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          payload=$(python3 - <<'PY'
+          import json
+          print(json.dumps({
+              'workflow': 'deploy-production',
+              'repository': '${{ github.repository }}',
+              'status': '${{ job.status }}',
+              'environment': '${{ inputs.environment_name }}',
+              'image_ref': '${{ steps.image-ref.outputs.image_ref }}',
+          }))
+          PY
+            )
+          curl -fsSL -X POST -H 'Content-Type: application/json' -d "$payload" "$WEBHOOK_URL"

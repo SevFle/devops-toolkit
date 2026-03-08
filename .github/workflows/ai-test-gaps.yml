@@ -29,7 +29,7 @@ permissions:
 
 jobs:
   test-gaps:
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -186,7 +186,7 @@ jobs:
           echo "response_file=$RESPONSE_FILE" >> "$GITHUB_OUTPUT"
 
           # Check if any test files were generated
-          NEW_TESTS=$(git status --porcelain | grep -c '^\?' || echo 0)
+          NEW_TESTS=$(git status --porcelain | awk '/^\?\?/ {count++} END {print count+0}')
           echo "new_test_count=$NEW_TESTS" >> "$GITHUB_OUTPUT"
 
       - name: Create PR with generated tests

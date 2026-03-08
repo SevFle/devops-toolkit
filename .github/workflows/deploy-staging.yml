@@ -22,6 +22,10 @@ on:
         type: number
         default: 50
         description: 'Seconds to wait for health check after deploy'
+      health_check_retries:
+        type: number
+        default: 6
+        description: 'How many times to poll container health before failing'
       env_vars:
         type: string
         default: ''
@@ -30,6 +34,22 @@ on:
         type: string
         default: ''
         description: 'Comma-separated required env var names to validate'
+      environment_name:
+        type: string
+        default: 'staging'
+        description: 'GitHub environment name for deployment protection rules'
+      pre_deploy_command:
+        type: string
+        default: ''
+        description: 'Optional command to run on the target host before deployment'
+      migrate_command:
+        type: string
+        default: ''
+        description: 'Optional migration command to run on the target host'
+      post_deploy_command:
+        type: string
+        default: ''
+        description: 'Optional command to run on the target host after deployment'
       runners:
         type: string
         default: 'self-hosted'
@@ -42,10 +62,13 @@ on:
         required: true
       DEPLOY_PORT:
         required: false
+      NOTIFY_WEBHOOK_URL:
+        required: false
 
 jobs:
   deploy:
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
+    environment: ${{ inputs.environment_name }}
     permissions:
       contents: write
     steps:
@@ -118,15 +141,23 @@ jobs:
         env:
           ENV_VARS_CONTENT: ${{ inputs.env_vars }}
           REQUIRED_ENV_VARS: ${{ inputs.required_env_vars }}
+          PRE_DEPLOY_COMMAND: ${{ inputs.pre_deploy_command }}
+          MIGRATE_COMMAND: ${{ inputs.migrate_command }}
+          POST_DEPLOY_COMMAND: ${{ inputs.post_deploy_command }}
+          HEALTH_RETRIES: ${{ inputs.health_check_retries }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: ${{ secrets.DEPLOY_PORT || 22 }}
-          envs: ENV_VARS_CONTENT,REQUIRED_ENV_VARS
+          envs: ENV_VARS_CONTENT,REQUIRED_ENV_VARS,PRE_DEPLOY_COMMAND,MIGRATE_COMMAND,POST_DEPLOY_COMMAND,HEALTH_RETRIES
           script: |
-            set -e
+            set -euo pipefail
             cd ${{ inputs.deploy_dir }}
+
+            if [ -n "$PRE_DEPLOY_COMMAND" ]; then
+              bash -lc "$PRE_DEPLOY_COMMAND"
+            fi
 
             # Write env file if provided
             if [ -n "$ENV_VARS_CONTENT" ]; then
@@ -151,22 +182,72 @@ jobs:
                 env_file:
                   - $TMP_ENV
             EOF
-
-              docker compose -f ${{ inputs.docker_compose_path }} -f "$TMP_OVERRIDE" down || true
-              docker compose -f ${{ inputs.docker_compose_path }} -f "$TMP_OVERRIDE" up -d
-              sleep ${{ inputs.health_check_wait }}
-              rm -f "$TMP_OVERRIDE" "$TMP_ENV"
             else
-              docker compose -f ${{ inputs.docker_compose_path }} down || true
-              docker compose -f ${{ inputs.docker_compose_path }} up -d
-              sleep ${{ inputs.health_check_wait }}
+              TMP_OVERRIDE=''
+              TMP_ENV=''
             fi
 
-            if docker ps | grep "${{ inputs.app_name }}" | grep -q "healthy"; then
-              echo "Deployment successful!"
+            if [ -n "$MIGRATE_COMMAND" ]; then
+              bash -lc "$MIGRATE_COMMAND"
+            fi
+
+            if [ -n "$TMP_OVERRIDE" ]; then
+              docker compose -f ${{ inputs.docker_compose_path }} -f "$TMP_OVERRIDE" up -d --remove-orphans
             else
-              echo "Health check failed!"
-              docker ps -a | grep "${{ inputs.app_name }}"
-              docker logs "${{ inputs.app_name }}" --tail 50
+              docker compose -f ${{ inputs.docker_compose_path }} up -d --remove-orphans
+            fi
+
+            if [ -n "$POST_DEPLOY_COMMAND" ]; then
+              bash -lc "$POST_DEPLOY_COMMAND"
+            fi
+
+            attempt=1
+            healthy='false'
+            while [ "$attempt" -le "$HEALTH_RETRIES" ]; do
+              if docker ps --filter "name=${{ inputs.app_name }}" --format '{{.Status}}' | grep -qi 'healthy'; then
+                healthy='true'
+                break
+              fi
+              sleep ${{ inputs.health_check_wait }}
+              attempt=$((attempt + 1))
+            done
+
+            [ -n "$TMP_OVERRIDE" ] && rm -f "$TMP_OVERRIDE"
+            [ -n "$TMP_ENV" ] && rm -f "$TMP_ENV"
+
+            if [ "$healthy" != 'true' ]; then
+              echo 'Health check failed!'
+              docker ps -a | grep "${{ inputs.app_name }}" || true
+              docker logs "${{ inputs.app_name }}" --tail 100 || true
               exit 1
             fi
+
+            echo 'Deployment successful!'
+
+      - name: Summary
+        if: always()
+        run: |
+          echo '## Staging Deployment' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Environment:** ${{ inputs.environment_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Version:** ${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Status:** ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify webhook
+        if: always() && secrets.NOTIFY_WEBHOOK_URL != ''
+        env:
+          WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          payload=$(python3 - <<'PY'
+          import json
+          print(json.dumps({
+              'workflow': 'deploy-staging',
+              'repository': '${{ github.repository }}',
+              'status': '${{ job.status }}',
+              'environment': '${{ inputs.environment_name }}',
+              'version': '${{ steps.version.outputs.version }}',
+          }))
+          PY
+            )
+          curl -fsSL -X POST -H 'Content-Type: application/json' -d "$payload" "$WEBHOOK_URL"

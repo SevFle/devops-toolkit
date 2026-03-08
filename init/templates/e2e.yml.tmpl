@@ -1,4 +1,4 @@
-name: Security
+name: E2E Tests
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -7,12 +7,10 @@ on:
       - 'docs/**'
       - '.github/ISSUE_TEMPLATE/**'
   schedule:
-    - cron: '0 3 * * 1'
+    - cron: '0 1 * * *'
   workflow_dispatch:
 jobs:
-  security:
+  e2e:
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
-    uses: SevFle/devops-toolkit/.github/workflows/security.yml@main
-    with:
-      scan_docker: {{SCAN_DOCKER}}
+    uses: SevFle/devops-toolkit/.github/workflows/e2e.yml@main
     secrets: inherit

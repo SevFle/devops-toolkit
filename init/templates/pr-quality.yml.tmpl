@@ -2,6 +2,10 @@ name: PR Quality
 on:
   pull_request:
     types: [opened, synchronize, edited, reopened, ready_for_review]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
 jobs:
   quality:
     if: ${{ !github.event.pull_request.draft }}

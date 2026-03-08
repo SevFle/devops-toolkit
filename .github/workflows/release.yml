@@ -47,7 +47,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -82,6 +82,7 @@ jobs:
       - run: ${{ inputs.lint_command }}
 
       - name: Commit and tag
+        if: ${{ !inputs.dry_run }}
         run: |
           git add package.json package-lock.json
           git commit -m "chore(release): bump version to v${{ steps.bump.outputs.version }}"
@@ -147,6 +148,7 @@ jobs:
           rm -f "$PROMPT_FILE" "$RESPONSE_FILE" "$NOTES_FILE" 2>/dev/null || true
 
       - name: Create GitHub Release
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.bump.outputs.version }}
@@ -168,3 +170,4 @@ jobs:
           echo "### Release Complete" >> $GITHUB_STEP_SUMMARY
           echo "**Version:** v${{ steps.bump.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "**Type:** ${{ inputs.version_bump }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Dry run:** ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY

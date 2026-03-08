@@ -7,6 +7,7 @@ set -euo pipefail
 TOOLKIT_REPO="SevFle/devops-toolkit"
 TOOLKIT_REF="main"
 RAW_BASE="https://raw.githubusercontent.com/${TOOLKIT_REPO}/${TOOLKIT_REF}"
+LOCAL_TEMPLATE_ROOT="${DEVOPS_TOOLKIT_LOCAL_ROOT:-}"
 
 # Colors
 RED='\033[0;31m'
@@ -129,13 +130,16 @@ render_template() {
   local output="$2"
   shift 2
 
-  # Download template
   local tmp
   tmp=$(mktemp)
-  if ! curl -fsSL "${RAW_BASE}/init/templates/${template}" -o "$tmp" 2>/dev/null; then
-    err "Failed to download template: $template"
-    rm -f "$tmp"
-    return 1
+  if [ -n "$LOCAL_TEMPLATE_ROOT" ] && [ -f "$LOCAL_TEMPLATE_ROOT/init/templates/${template}" ]; then
+    cp "$LOCAL_TEMPLATE_ROOT/init/templates/${template}" "$tmp"
+  else
+    if ! curl -fsSL "${RAW_BASE}/init/templates/${template}" -o "$tmp" 2>/dev/null; then
+      err "Failed to download template: $template"
+      rm -f "$tmp"
+      return 1
+    fi
   fi
 
   # Replace variables
@@ -152,10 +156,9 @@ render_template() {
 
   # Remove conditional blocks for disabled features
   # {{#FEATURE}}...{{/FEATURE}} blocks
-  # NOTE: This sed command only handles single-level blocks. Nested
-  # {{#FEATURE}}...{{/FEATURE}} blocks are not supported and will produce
-  # incorrect results because the range match consumes the first {{/ delimiter.
-  content=$(echo "$content" | sed '/{{#/,/{{\//{/{{#\|{{\//{d}}')
+  # NOTE: Nested blocks are still not supported, but this Python fallback is
+  # portable across GNU/BSD environments and does not rely on sed dialects.
+  content=$(CONTENT="$content" python3 -c "import os, re; print(re.sub(r'\\n?\\{\\{#[A-Z_]+\\}\\}[\\s\\S]*?\\{\\{/[A-Z_]+\\}\\}\\n?', '\\n', os.environ['CONTENT']), end='')")
 
   mkdir -p "$(dirname "$output")"
   echo "$content" > "$output"
@@ -197,21 +200,45 @@ main() {
 
   local enable_ci=false
   local enable_e2e=false
+  local enable_security=false
+  local enable_pr_quality=false
+  local enable_codeql=false
+  local enable_ai_code_review=false
   local enable_deploy_staging=false
   local enable_deploy_prod=false
+  local enable_deploy_k8s=false
   local enable_ci_heal=false
+  local enable_housekeeping=false
   local enable_openspec=false
+  local enable_owasp_audit=false
+  local enable_perf_audit=false
+  local enable_test_gaps=false
+  local enable_dead_code=false
+  local enable_api_compat=false
+  local enable_tech_debt=false
 
   ask_yes_no "  CI Pipeline (lint, type-check, test, build)" "y" && enable_ci=true
   ask_yes_no "  E2E Tests (Playwright)" "n" && enable_e2e=true
+  ask_yes_no "  Security Scans (secrets, deps, containers)" "y" && enable_security=true
+  ask_yes_no "  PR Quality Gate" "y" && enable_pr_quality=true
+  ask_yes_no "  CodeQL Analysis" "n" && enable_codeql=true
+  ask_yes_no "  AI Code Review" "n" && enable_ai_code_review=true
 
   if [ "$has_docker" = "true" ]; then
     ask_yes_no "  Deploy to Staging (Docker + VPS)" "n" && enable_deploy_staging=true
     ask_yes_no "  Deploy to Production (Docker + VPS)" "n" && enable_deploy_prod=true
+    ask_yes_no "  Deploy to Kubernetes" "n" && enable_deploy_k8s=true
   fi
 
   ask_yes_no "  CI Auto-Heal (Claude fixes CI failures)" "n" && enable_ci_heal=true
+  ask_yes_no "  Housekeeping (stale issues, branch cleanup)" "n" && enable_housekeeping=true
   ask_yes_no "  OpenSpec Pipeline (interview + propose + orchestrate)" "n" && enable_openspec=true
+  ask_yes_no "  Weekly OWASP Audit" "n" && enable_owasp_audit=true
+  ask_yes_no "  Weekly Performance Audit" "n" && enable_perf_audit=true
+  ask_yes_no "  Weekly Test Gap Analysis" "n" && enable_test_gaps=true
+  ask_yes_no "  Weekly Dead Code Analysis" "n" && enable_dead_code=true
+  ask_yes_no "  PR API Compatibility Check" "n" && enable_api_compat=true
+  ask_yes_no "  Weekly Tech Debt Scan" "n" && enable_tech_debt=true
 
   echo ""
 
@@ -221,211 +248,135 @@ main() {
     [ "$has_docker" = "true" ] && docker_flag="true"
 
     if [ "$project_type" = "go" ]; then
-      # Go-specific CI: prompt for optional lint tool
-      local go_lint_cmd="golangci-lint run"
-      if ask_yes_no "    Use golangci-lint for Go linting?" "y"; then
-        go_lint_cmd="golangci-lint run"
-      fi
-
-      cat > .github/workflows/ci.yml << CIEOF
-name: CI
-on:
-  pull_request:
-  push:
-    branches: [${base_branch}]
-concurrency:
-  group: ci-\${{ github.ref }}
-  cancel-in-progress: true
-jobs:
-  ci:
-    uses: ${TOOLKIT_REPO}/.github/workflows/ci.yml@${TOOLKIT_REF}
-    with:
-      install_command: 'go mod download'
-      test_command: 'go test ./...'
-      build_command: 'go build ./...'
-      lint_command: '${go_lint_cmd}'
-      typecheck_command: 'go vet ./...'
-      docker_build: ${docker_flag}
-    secrets: inherit
-CIEOF
-      ok "Created .github/workflows/ci.yml (Go)"
+      render_template \
+        "ci-go.yml.tmpl" \
+        ".github/workflows/ci.yml" \
+        BASE_BRANCH "$base_branch" \
+        DOCKER_BUILD "$docker_flag"
 
     elif [ "$project_type" = "python" ]; then
-      # Python-specific CI: prompt for tooling preferences
-      local py_test_cmd="pytest"
-      local py_lint_cmd="ruff check ."
-      local py_typecheck_cmd="mypy ."
-      local py_install_cmd='pip install -e ".[dev]"'
-
-      if ask_yes_no "    Use ruff for Python linting?" "y"; then
-        py_lint_cmd="ruff check ."
-      else
-        py_lint_cmd="flake8"
-      fi
-      if ask_yes_no "    Use mypy for type checking?" "y"; then
-        py_typecheck_cmd="mypy ."
-      else
-        py_typecheck_cmd="echo 'No type check'"
-      fi
-
-      cat > .github/workflows/ci.yml << CIEOF
-name: CI
-on:
-  pull_request:
-  push:
-    branches: [${base_branch}]
-concurrency:
-  group: ci-\${{ github.ref }}
-  cancel-in-progress: true
-jobs:
-  ci:
-    uses: ${TOOLKIT_REPO}/.github/workflows/ci.yml@${TOOLKIT_REF}
-    with:
-      install_command: '${py_install_cmd}'
-      test_command: '${py_test_cmd}'
-      build_command: 'echo "No build step"'
-      lint_command: '${py_lint_cmd}'
-      typecheck_command: '${py_typecheck_cmd}'
-      docker_build: ${docker_flag}
-    secrets: inherit
-CIEOF
-      ok "Created .github/workflows/ci.yml (Python)"
+      render_template \
+        "ci-python.yml.tmpl" \
+        ".github/workflows/ci.yml" \
+        BASE_BRANCH "$base_branch" \
+        DOCKER_BUILD "$docker_flag"
 
     else
-      # Node.js default
-      cat > .github/workflows/ci.yml << CIEOF
-name: CI
-on:
-  pull_request:
-  push:
-    branches: [${base_branch}]
-concurrency:
-  group: ci-\${{ github.ref }}
-  cancel-in-progress: true
-jobs:
-  ci:
-    uses: ${TOOLKIT_REPO}/.github/workflows/ci.yml@${TOOLKIT_REF}
-    with:
-      docker_build: ${docker_flag}
-    secrets: inherit
-CIEOF
-      ok "Created .github/workflows/ci.yml"
+      render_template \
+        "ci.yml.tmpl" \
+        ".github/workflows/ci.yml" \
+        BASE_BRANCH "$base_branch" \
+        DOCKER_BUILD "$docker_flag"
     fi
   fi
 
   if [ "$enable_e2e" = "true" ]; then
-    cat > .github/workflows/e2e.yml << E2EEOF
-name: E2E Tests
-on:
-  schedule:
-    - cron: '0 1 * * *'
-  workflow_dispatch:
-jobs:
-  e2e:
-    uses: ${TOOLKIT_REPO}/.github/workflows/e2e.yml@${TOOLKIT_REF}
-    secrets: inherit
-E2EEOF
-    ok "Created .github/workflows/e2e.yml"
+    render_template "e2e.yml.tmpl" ".github/workflows/e2e.yml"
+  fi
+
+  if [ "$enable_security" = "true" ]; then
+    render_template \
+      "security.yml.tmpl" \
+      ".github/workflows/security.yml" \
+      SCAN_DOCKER "$has_docker"
+  fi
+
+  if [ "$enable_pr_quality" = "true" ]; then
+    render_template "pr-quality.yml.tmpl" ".github/workflows/pr-quality.yml"
+  fi
+
+  if [ "$enable_codeql" = "true" ]; then
+    render_template \
+      "codeql.yml.tmpl" \
+      ".github/workflows/codeql.yml" \
+      BASE_BRANCH "$base_branch"
+  fi
+
+  if [ "$enable_ai_code_review" = "true" ]; then
+    render_template "ai-code-review.yml.tmpl" ".github/workflows/ai-code-review.yml"
   fi
 
   if [ "$enable_deploy_staging" = "true" ]; then
     local app_name
-    read -rp "  App name for staging (e.g., myapp-beta): " app_name
-    app_name="${app_name:-app-beta}"
+    read -rp "  App name for staging (e.g., myapp): " app_name
+    app_name="${app_name:-app}"
 
-    cat > .github/workflows/deploy-staging.yml << DSEOF
-name: Deploy Staging
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-jobs:
-  deploy:
-    uses: ${TOOLKIT_REPO}/.github/workflows/deploy-staging.yml@${TOOLKIT_REF}
-    with:
-      app_name: ${app_name}
-      deploy_dir: /opt/services/apps/${app_name}
-      image_name: ghcr.io/\${{ github.repository_owner }}/\${{ github.event.repository.name }}
-    secrets: inherit
-DSEOF
-    ok "Created .github/workflows/deploy-staging.yml"
+    render_template \
+      "deploy-staging.yml.tmpl" \
+      ".github/workflows/deploy-staging.yml" \
+      BASE_BRANCH "$base_branch" \
+      APP_NAME "$app_name"
   fi
 
   if [ "$enable_deploy_prod" = "true" ]; then
     local app_name_prod
-    read -rp "  App name for production (e.g., myapp-prod): " app_name_prod
-    app_name_prod="${app_name_prod:-app-prod}"
+    read -rp "  App name for production (e.g., myapp): " app_name_prod
+    app_name_prod="${app_name_prod:-app}"
 
-    cat > .github/workflows/deploy-production.yml << DPEOF
-name: Deploy Production
-on:
-  release:
-    types: [published]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to deploy'
-        required: true
-jobs:
-  deploy:
-    uses: ${TOOLKIT_REPO}/.github/workflows/deploy-production.yml@${TOOLKIT_REF}
-    with:
-      app_name: ${app_name_prod}
-      deploy_dir: /opt/services/apps/${app_name_prod}
-      image_name: ghcr.io/\${{ github.repository_owner }}/\${{ github.event.repository.name }}
-      version: \${{ inputs.version || github.event.release.tag_name }}
-    secrets: inherit
-DPEOF
-    ok "Created .github/workflows/deploy-production.yml"
+    render_template \
+      "deploy-production.yml.tmpl" \
+      ".github/workflows/deploy-production.yml" \
+      APP_NAME "$app_name_prod"
+  fi
+
+  if [ "$enable_deploy_k8s" = "true" ]; then
+    local namespace
+    read -rp "  Kubernetes namespace: " namespace
+    namespace="${namespace:-default}"
+    local app_name_k8s
+    read -rp "  Kubernetes deployment name: " app_name_k8s
+    app_name_k8s="${app_name_k8s:-app}"
+
+    render_template \
+      "deploy-k8s.yml.tmpl" \
+      ".github/workflows/deploy-k8s.yml" \
+      BASE_BRANCH "$base_branch" \
+      APP_NAME "$app_name_k8s" \
+      NAMESPACE "$namespace"
   fi
 
   if [ "$enable_ci_heal" = "true" ]; then
-    cat > .github/workflows/ci-heal.yml << CHEOF
-name: CI Auto-Heal
-on:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-jobs:
-  heal:
-    uses: ${TOOLKIT_REPO}/.github/workflows/ci-heal.yml@${TOOLKIT_REF}
-    secrets: inherit
-CHEOF
-    ok "Created .github/workflows/ci-heal.yml"
+    render_template "ci-heal.yml.tmpl" ".github/workflows/ci-heal.yml"
+  fi
+
+  if [ "$enable_housekeeping" = "true" ]; then
+    render_template "housekeeping.yml.tmpl" ".github/workflows/housekeeping.yml"
   fi
 
   if [ "$enable_openspec" = "true" ]; then
-    cat > .github/workflows/openspec-interview.yml << OIEOF
-name: OpenSpec Interview
-on:
-  issues:
-    types: [labeled]
-  issue_comment:
-    types: [created]
-jobs:
-  interview:
-    uses: ${TOOLKIT_REPO}/.github/workflows/openspec-interview.yml@${TOOLKIT_REF}
-    secrets: inherit
-OIEOF
-    ok "Created .github/workflows/openspec-interview.yml"
+    render_template "openspec-interview.yml.tmpl" ".github/workflows/openspec-interview.yml"
+    render_template \
+      "openspec-propose.yml.tmpl" \
+      ".github/workflows/openspec-propose.yml" \
+      BASE_BRANCH "$base_branch"
+    render_template \
+      "openspec-orchestrate.yml.tmpl" \
+      ".github/workflows/openspec-orchestrate.yml" \
+      BASE_BRANCH "$base_branch"
+  fi
 
-    cat > .github/workflows/openspec-orchestrate.yml << OOEOF
-name: OpenSpec Orchestrate
-on:
-  workflow_dispatch:
-    inputs:
-      change_name:
-        description: 'OpenSpec change name'
-        required: true
-jobs:
-  orchestrate:
-    uses: ${TOOLKIT_REPO}/.github/workflows/openspec-orchestrate.yml@${TOOLKIT_REF}
-    with:
-      change_name: \${{ inputs.change_name }}
-      base_branch: ${base_branch}
-    secrets: inherit
-OOEOF
-    ok "Created .github/workflows/openspec-orchestrate.yml"
+  if [ "$enable_owasp_audit" = "true" ]; then
+    render_template "ai-owasp-audit.yml.tmpl" ".github/workflows/ai-owasp-audit.yml"
+  fi
+
+  if [ "$enable_perf_audit" = "true" ]; then
+    render_template "ai-perf-audit.yml.tmpl" ".github/workflows/ai-perf-audit.yml"
+  fi
+
+  if [ "$enable_test_gaps" = "true" ]; then
+    render_template "ai-test-gaps.yml.tmpl" ".github/workflows/ai-test-gaps.yml"
+  fi
+
+  if [ "$enable_dead_code" = "true" ]; then
+    render_template "ai-dead-code.yml.tmpl" ".github/workflows/ai-dead-code.yml"
+  fi
+
+  if [ "$enable_api_compat" = "true" ]; then
+    render_template "ai-api-compat.yml.tmpl" ".github/workflows/ai-api-compat.yml"
+  fi
+
+  if [ "$enable_tech_debt" = "true" ]; then
+    render_template "ai-tech-debt.yml.tmpl" ".github/workflows/ai-tech-debt.yml"
   fi
 
   # Print next steps
@@ -443,6 +394,9 @@ OOEOF
   fi
   if [ "$enable_deploy_staging" = "true" ] || [ "$enable_deploy_prod" = "true" ]; then
     echo "     - DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_PORT"
+  fi
+  if [ "$enable_deploy_k8s" = "true" ]; then
+    echo "     - REGISTRY_USERNAME, REGISTRY_PASSWORD, KUBECONFIG"
   fi
 
   echo ""

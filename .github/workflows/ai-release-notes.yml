@@ -37,7 +37,7 @@ permissions:
 jobs:
   generate-notes:
     name: Generate Release Notes
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     outputs:
       release_notes: ${{ steps.output.outputs.release_notes }}
     steps:
@@ -45,6 +45,13 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Checkout devops-toolkit for prompts
+        uses: actions/checkout@v6
+        with:
+          repository: SevFle/devops-toolkit
+          path: .devops-toolkit
+          ref: main
 
       - name: Determine previous tag
         id: prev-tag

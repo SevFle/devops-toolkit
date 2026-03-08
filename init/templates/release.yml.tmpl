@@ -1,0 +1,24 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'major, minor, or patch'
+        required: true
+        default: 'patch'
+      pre_release:
+        description: 'Create a pre-release'
+        required: false
+        default: 'false'
+      dry_run:
+        description: 'Preview without pushing tags or publishing'
+        required: false
+        default: 'false'
+jobs:
+  release:
+    uses: SevFle/devops-toolkit/.github/workflows/release.yml@main
+    with:
+      version_bump: ${{ inputs.version_bump }}
+      pre_release: ${{ fromJSON(inputs.pre_release) }}
+      dry_run: ${{ fromJSON(inputs.dry_run) }}
+    secrets: inherit

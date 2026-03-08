@@ -3,14 +3,26 @@ name: CI Pipeline
 on:
   workflow_call:
     inputs:
+      runtime:
+        type: string
+        default: 'auto'
+        description: 'Runtime to configure: auto, node, python, go'
       node_version:
         type: string
         default: '22'
         description: 'Node.js version'
+      python_version:
+        type: string
+        default: '3.11'
+        description: 'Python version'
+      go_version:
+        type: string
+        default: '1.22'
+        description: 'Go version'
       package_manager:
         type: string
         default: 'npm'
-        description: 'Package manager (npm or pnpm)'
+        description: 'Package manager for Node.js projects (npm or pnpm)'
       install_command:
         type: string
         default: 'npm ci'
@@ -39,10 +51,18 @@ on:
         type: number
         default: 75
         description: 'Minimum coverage percentage'
+      test_results_path:
+        type: string
+        default: 'test-results.xml'
+        description: 'Path to the generated test result file'
+      coverage_path:
+        type: string
+        default: 'coverage/lcov.info'
+        description: 'Path to the generated coverage report'
       docker_build:
         type: boolean
         default: false
-        description: 'Whether to build Docker image'
+        description: 'Whether to build the Docker image'
       working_directory:
         type: string
         default: '.'
@@ -50,7 +70,15 @@ on:
       skip_branch_filter:
         type: string
         default: 'openspec-auto/'
-        description: 'Skip CI for branches matching this prefix'
+        description: 'Skip CI entirely for branches matching this prefix'
+      path_ignore_globs:
+        type: string
+        default: |
+          *.md
+          **/*.md
+          docs/**
+          .github/ISSUE_TEMPLATE/**
+        description: 'Newline-separated globs that should short-circuit CI when they are the only changed files'
       e2e_enabled:
         type: boolean
         default: false
@@ -63,11 +91,17 @@ on:
         type: boolean
         default: false
         description: 'Enable test report and coverage publishing'
+      detect_flaky_tests:
+        type: boolean
+        default: false
+        description: 'Retry failed tests once and report if they pass on retry'
+      flaky_retry_command:
+        type: string
+        default: ''
+        description: 'Optional retry command for flaky test detection'
       runners:
         type: string
         default: 'self-hosted'
-        # Accepted formats: plain string (e.g. "self-hosted") or valid JSON array
-        # (e.g. '["self-hosted", "linux"]'). Invalid JSON will cause a runtime error.
         description: 'Runner label(s), JSON array or string'
 
 concurrency:
@@ -75,99 +109,310 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  install:
-    name: Install Dependencies
+  changes:
+    name: Detect Changes
     runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
+    outputs:
+      should_skip: ${{ steps.filter.outputs.should_skip }}
+      runtime: ${{ steps.runtime.outputs.runtime }}
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
         with:
-          node-version: ${{ inputs.node_version }}
-          cache: ${{ inputs.package_manager }}
-      - run: ${{ inputs.install_command }}
+          fetch-depth: 0
+
+      - name: Resolve runtime
+        id: runtime
         working-directory: ${{ inputs.working_directory }}
-      - uses: actions/cache/save@v4
-        with:
-          path: node_modules
-          key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUNTIME="${{ inputs.runtime }}"
+          if [ "$RUNTIME" = 'auto' ]; then
+            if [ -f package.json ]; then
+              RUNTIME='node'
+            elif [ -f pyproject.toml ] || [ -f setup.py ] || [ -f requirements.txt ]; then
+              RUNTIME='python'
+            elif [ -f go.mod ]; then
+              RUNTIME='go'
+            else
+              RUNTIME='node'
+            fi
+          fi
+          echo "runtime=$RUNTIME" >> "$GITHUB_OUTPUT"
+
+      - name: Determine whether CI can be skipped
+        id: filter
+        env:
+          PATH_IGNORE_GLOBS: ${{ inputs.path_ignore_globs }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          BEFORE_SHA: ${{ github.event.before || '' }}
+          SKIP_BRANCH_FILTER: ${{ inputs.skip_branch_filter }}
+          CURRENT_REF: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "$SKIP_BRANCH_FILTER" ] && [[ "$CURRENT_REF" == "$SKIP_BRANCH_FILTER"* ]]; then
+            echo "should_skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping CI because branch matches skip filter: $SKIP_BRANCH_FILTER" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          DIFF_RANGE=''
+          if [ -n "$BASE_REF" ]; then
+            git fetch origin "$BASE_REF" --depth=1
+            DIFF_RANGE="origin/${BASE_REF}...HEAD"
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != '0000000000000000000000000000000000000000' ]; then
+            DIFF_RANGE="$BEFORE_SHA...HEAD"
+          elif git rev-parse HEAD^ >/dev/null 2>&1; then
+            DIFF_RANGE='HEAD^...HEAD'
+          fi
+
+          if [ -z "$DIFF_RANGE" ]; then
+            echo "should_skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED_FILE=$(mktemp)
+          git diff --name-only "$DIFF_RANGE" > "$CHANGED_FILE"
+
+          if [ ! -s "$CHANGED_FILE" ]; then
+            echo "should_skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - "$CHANGED_FILE" <<'PY' > "$RUNNER_TEMP/ci-skip-decision.txt"
+          from fnmatch import fnmatch
+          from pathlib import Path
+          import os
+          import sys
+
+          changed_files = [line.strip() for line in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines() if line.strip()]
+          patterns = [line.strip() for line in os.environ.get('PATH_IGNORE_GLOBS', '').splitlines() if line.strip()]
+
+          should_skip = bool(changed_files) and all(any(fnmatch(path, pattern) for pattern in patterns) for path in changed_files)
+          print('true' if should_skip else 'false')
+          PY
+
+          SHOULD_SKIP=$(cat "$RUNNER_TEMP/ci-skip-decision.txt")
+          echo "should_skip=$SHOULD_SKIP" >> "$GITHUB_OUTPUT"
+          if [ "$SHOULD_SKIP" = 'true' ]; then
+            echo 'Only ignored files changed; skipping CI jobs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   type-check:
     name: Type Check
+    needs: changes
+    if: needs.changes.outputs.should_skip != 'true'
     runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
-    needs: install
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
+        if: needs.changes.outputs.runtime == 'node'
         with:
           node-version: ${{ inputs.node_version }}
-      - uses: actions/cache/restore@v4
+          cache: ${{ inputs.package_manager }}
+      - uses: actions/setup-python@v5
+        if: needs.changes.outputs.runtime == 'python'
         with:
-          path: node_modules
-          key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml') }}
-      - run: ${{ inputs.typecheck_command }}
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+      - uses: actions/setup-go@v5
+        if: needs.changes.outputs.runtime == 'go'
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+      - name: Install dependencies
+        shell: bash
         working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.install_command }}
+      - name: Run type check
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.typecheck_command }}
 
   lint:
     name: Lint
+    needs: changes
+    if: needs.changes.outputs.should_skip != 'true'
     runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
-    needs: install
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
+        if: needs.changes.outputs.runtime == 'node'
         with:
           node-version: ${{ inputs.node_version }}
-      - uses: actions/cache/restore@v4
+          cache: ${{ inputs.package_manager }}
+      - uses: actions/setup-python@v5
+        if: needs.changes.outputs.runtime == 'python'
         with:
-          path: node_modules
-          key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml') }}
-      - run: ${{ inputs.lint_command }}
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+      - uses: actions/setup-go@v5
+        if: needs.changes.outputs.runtime == 'go'
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+      - name: Install dependencies
+        shell: bash
         working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.install_command }}
+      - name: Run lint
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.lint_command }}
 
   unit-tests:
     name: Unit Tests
+    needs: changes
+    if: needs.changes.outputs.should_skip != 'true'
     runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
-    needs: install
+    outputs:
+      flaky_detected: ${{ steps.tests.outputs.flaky_detected }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
+        if: needs.changes.outputs.runtime == 'node'
         with:
           node-version: ${{ inputs.node_version }}
-      - uses: actions/cache/restore@v4
+          cache: ${{ inputs.package_manager }}
+      - uses: actions/setup-python@v5
+        if: needs.changes.outputs.runtime == 'python'
         with:
-          path: node_modules
-          key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml') }}
-      - name: Run tests
-        run: ${{ inputs.test_command }}
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+      - uses: actions/setup-go@v5
+        if: needs.changes.outputs.runtime == 'go'
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+      - name: Install dependencies
+        shell: bash
         working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.install_command }}
+      - name: Run tests
+        id: tests
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
+          DETECT_FLAKY: ${{ inputs.detect_flaky_tests }}
+          FLAKY_RETRY_COMMAND: ${{ inputs.flaky_retry_command }}
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          set -u
+          flaky_detected='false'
+          retry_command="$TEST_COMMAND"
+          if [ -n "$FLAKY_RETRY_COMMAND" ]; then
+            retry_command="$FLAKY_RETRY_COMMAND"
+          fi
+
+          set +e
+          bash -c "$TEST_COMMAND"
+          status=$?
+          if [ "$status" -ne 0 ] && [ "$DETECT_FLAKY" = 'true' ]; then
+            echo 'Initial test run failed, retrying once to detect flakiness...' >> "$GITHUB_STEP_SUMMARY"
+            bash -c "$retry_command"
+            retry_status=$?
+            if [ "$retry_status" -eq 0 ]; then
+              flaky_detected='true'
+              status=0
+              echo '⚠️ Tests passed on retry and may be flaky.' >> "$GITHUB_STEP_SUMMARY"
+            else
+              status=$retry_status
+            fi
+          fi
+          set -e
+
+          echo "flaky_detected=$flaky_detected" >> "$GITHUB_OUTPUT"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
       - name: Generate coverage
         if: inputs.coverage_command != ''
-        run: ${{ inputs.coverage_command }}
+        shell: bash
         working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.coverage_command }}
+
+      - name: Upload test artifacts
+        if: inputs.test_report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-artifacts
+          path: |
+            ${{ inputs.working_directory }}/${{ inputs.test_results_path }}
+            ${{ inputs.working_directory }}/${{ inputs.coverage_path }}
+          if-no-files-found: warn
+          retention-days: 1
 
   build:
     name: Build
+    needs: changes
+    if: needs.changes.outputs.should_skip != 'true'
     runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
-    needs: install
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
+        if: needs.changes.outputs.runtime == 'node'
         with:
           node-version: ${{ inputs.node_version }}
-      - uses: actions/cache/restore@v4
+          cache: ${{ inputs.package_manager }}
+      - uses: actions/setup-python@v5
+        if: needs.changes.outputs.runtime == 'python'
         with:
-          path: node_modules
-          key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml') }}
-      - name: Build
-        run: ${{ inputs.build_command }}
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+      - uses: actions/setup-go@v5
+        if: needs.changes.outputs.runtime == 'go'
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+      - name: Install dependencies
+        shell: bash
         working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.install_command }}
+      - name: Build
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.build_command }}
         env:
           NODE_ENV: production
 
+  e2e:
+    name: E2E Tests
+    needs: changes
+    if: needs.changes.outputs.should_skip != 'true' && inputs.e2e_enabled
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        if: needs.changes.outputs.runtime == 'node'
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.package_manager }}
+      - uses: actions/setup-python@v5
+        if: needs.changes.outputs.runtime == 'python'
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+      - uses: actions/setup-go@v5
+        if: needs.changes.outputs.runtime == 'go'
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: true
+      - name: Install dependencies
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.install_command }}
+      - name: Run E2E tests
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        run: ${{ inputs.e2e_command }}
+
   docker-build:
     name: Docker Build
-    if: inputs.docker_build
+    needs: changes
+    if: needs.changes.outputs.should_skip != 'true' && inputs.docker_build
     runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
-    needs: install
     steps:
       - uses: actions/checkout@v6
       - uses: docker/setup-buildx-action@v3
@@ -180,42 +425,74 @@ jobs:
 
   test-report:
     name: Test Report
-    if: inputs.test_report
+    needs: [changes, unit-tests]
+    if: needs.changes.outputs.should_skip != 'true' && inputs.test_report
     runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
-    needs: unit-tests
     steps:
       - uses: actions/checkout@v6
-      - uses: SevFle/devops-toolkit/actions/test-report@main
+      - name: Download test artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
-          test_results_path: ${{ inputs.working_directory }}/test-results.xml
-          coverage_path: ${{ inputs.working_directory }}/coverage/lcov.info
-          base_branch: 'main'
+          name: ci-test-artifacts
+          path: ${{ inputs.working_directory }}
+      - id: report
+        uses: SevFle/devops-toolkit/actions/test-report@main
+        with:
+          test_results_path: ${{ inputs.working_directory }}/${{ inputs.test_results_path }}
+          coverage_path: ${{ inputs.working_directory }}/${{ inputs.coverage_path }}
+          base_branch: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch || 'main' }}
+      - name: Enforce coverage threshold
+        if: steps.report.outputs.coverage_pct != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+            coverage = float('${{ steps.report.outputs.coverage_pct }}')
+            threshold = float('${{ inputs.coverage_threshold }}')
+            if coverage < threshold:
+              raise SystemExit(f'Coverage {coverage:.1f}% is below the required threshold of {threshold:.1f}%')
+            print(f'Coverage {coverage:.1f}% meets the threshold of {threshold:.1f}%')
+            PY
 
   ci-status:
     name: CI Status
     if: always()
     runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
-    needs: [type-check, lint, unit-tests, build, docker-build]
+    needs: [changes, type-check, lint, unit-tests, build, e2e, docker-build, test-report]
     steps:
       - name: Check results
         run: |
+          set -euo pipefail
+          if [ "${{ needs.changes.outputs.should_skip }}" = 'true' ]; then
+            echo 'CI skipped because only ignored paths changed.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           echo "Type Check: ${{ needs.type-check.result }}"
           echo "Lint: ${{ needs.lint.result }}"
           echo "Tests: ${{ needs.unit-tests.result }}"
           echo "Build: ${{ needs.build.result }}"
+          echo "E2E: ${{ needs.e2e.result }}"
           echo "Docker: ${{ needs.docker-build.result }}"
+          echo "Test Report: ${{ needs.test-report.result }}"
 
-          if [[ "${{ needs.type-check.result }}" == "failure" ]] || \
-             [[ "${{ needs.lint.result }}" == "failure" ]] || \
-             [[ "${{ needs.unit-tests.result }}" == "failure" ]] || \
-             [[ "${{ needs.build.result }}" == "failure" ]]; then
-            echo "::error::CI checks failed"
-            exit 1
+          if [ "${{ needs.unit-tests.outputs.flaky_detected }}" = 'true' ]; then
+            echo '⚠️ Flaky tests detected: the suite passed on retry.' >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          if [[ "${{ needs.docker-build.result }}" == "failure" ]]; then
-            echo "::error::Docker build failed"
-            exit 1
-          fi
+          for result in \
+            "${{ needs.type-check.result }}" \
+            "${{ needs.lint.result }}" \
+            "${{ needs.unit-tests.result }}" \
+            "${{ needs.build.result }}" \
+            "${{ needs.e2e.result }}" \
+            "${{ needs.docker-build.result }}" \
+            "${{ needs.test-report.result }}"; do
+            if [ "$result" = 'failure' ]; then
+              echo '::error::CI checks failed'
+              exit 1
+            fi
+          done
 
-          echo "All CI checks passed!"
+          echo 'All CI checks passed!'

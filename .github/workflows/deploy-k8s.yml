@@ -47,6 +47,46 @@ on:
         type: number
         default: 300
         description: 'Seconds to wait for deployment health check'
+      health_check_url:
+        type: string
+        default: ''
+        description: 'Optional external URL to probe after rollout'
+      environment_name:
+        type: string
+        default: 'production'
+        description: 'GitHub environment name for deployment protection rules'
+      deployment_strategy:
+        type: string
+        default: 'rolling'
+        description: 'Deployment strategy: rolling, canary, blue-green'
+      canary_replicas:
+        type: number
+        default: 1
+        description: 'Replica count for canary deployments'
+      blue_green_suffix:
+        type: string
+        default: 'green'
+        description: 'Suffix to use for blue-green target deployments'
+      sign_image:
+        type: boolean
+        default: false
+        description: 'Sign the pushed image with Cosign'
+      attest_provenance:
+        type: boolean
+        default: true
+        description: 'Generate build provenance for the pushed image'
+      pre_deploy_command:
+        type: string
+        default: ''
+        description: 'Optional command to run before applying the rollout'
+      migrate_command:
+        type: string
+        default: ''
+        description: 'Optional command to run after the image is published and before rollout'
+      post_deploy_command:
+        type: string
+        default: ''
+        description: 'Optional command to run after rollout succeeds'
       runners:
         type: string
         default: 'self-hosted'
@@ -58,16 +98,24 @@ on:
         required: true
       KUBECONFIG:
         required: true
+      COSIGN_PRIVATE_KEY:
+        required: false
+      COSIGN_PASSWORD:
+        required: false
+      NOTIFY_WEBHOOK_URL:
+        required: false
 
 jobs:
   build-push:
     name: Build & Push Image
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     permissions:
       contents: read
       packages: write
+      id-token: write
     outputs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v6
 
@@ -90,6 +138,7 @@ jobs:
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -100,12 +149,40 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Attest build provenance
+        if: inputs.attest_provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ inputs.image_name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Install Cosign
+        if: inputs.sign_image
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        if: inputs.sign_image
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COSIGN_PRIVATE_KEY:-}" ]; then
+            echo '::error::COSIGN_PRIVATE_KEY is required when sign_image=true'
+            exit 1
+          fi
+          printf '%s' "$COSIGN_PRIVATE_KEY" > cosign.key
+          cosign sign --yes --key cosign.key "${{ inputs.image_name }}@${{ steps.build.outputs.digest }}"
+          rm -f cosign.key
+
   deploy:
     name: Deploy
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     needs: build-push
     permissions:
       contents: read
+    environment: ${{ inputs.environment_name }}
     steps:
       - uses: actions/checkout@v6
 
@@ -115,6 +192,14 @@ jobs:
           mkdir -p "$HOME/.kube"
           echo "${{ secrets.KUBECONFIG }}" > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
+
+      - name: Run pre-deploy command
+        if: inputs.pre_deploy_command != ''
+        run: ${{ inputs.pre_deploy_command }}
+
+      - name: Run migration command
+        if: inputs.migrate_command != ''
+        run: ${{ inputs.migrate_command }}
 
       - name: Deploy with Helm
         if: inputs.use_helm
@@ -132,7 +217,7 @@ jobs:
           helm upgrade ${{ inputs.deployment_name }} ${{ inputs.helm_chart }} $HELM_ARGS
 
       - name: Deploy with Kustomize
-        if: inputs.kustomize_path != '' && !inputs.use_helm
+        if: inputs.kustomize_path != '' && !inputs.use_helm && inputs.deployment_strategy == 'rolling'
         run: |
           set -euo pipefail
           kubectl apply -k "${{ inputs.kustomize_path }}" --namespace "${{ inputs.namespace }}"
@@ -140,18 +225,42 @@ jobs:
             --namespace "${{ inputs.namespace }}" \
             --timeout="${{ inputs.health_timeout }}s"
 
-      - name: Deploy with kubectl set image
+      - name: Deploy with kubectl strategy
         if: inputs.kustomize_path == '' && !inputs.use_helm
         env:
-          CONTAINER: ${{ inputs.container_name || inputs.deployment_name }}
+          DEFAULT_CONTAINER: ${{ inputs.container_name || inputs.deployment_name }}
         run: |
           set -euo pipefail
-          kubectl set image deployment/"${{ inputs.deployment_name }}" \
-            "${CONTAINER}=${{ needs.build-push.outputs.image_tag }}" \
-            --namespace "${{ inputs.namespace }}"
-          kubectl rollout status deployment/"${{ inputs.deployment_name }}" \
+          target_deployment='${{ inputs.deployment_name }}'
+          target_container="$DEFAULT_CONTAINER"
+
+          if [ '${{ inputs.deployment_strategy }}' = 'canary' ]; then
+            target_deployment='${{ inputs.deployment_name }}-canary'
+            kubectl create deployment "$target_deployment" \
+              --image='${{ needs.build-push.outputs.image_tag }}' \
+              --replicas='${{ inputs.canary_replicas }}' \
+              --namespace '${{ inputs.namespace }}' \
+              --dry-run=client -o yaml | kubectl apply -f -
+          elif [ '${{ inputs.deployment_strategy }}' = 'blue-green' ]; then
+            target_deployment='${{ inputs.deployment_name }}-${{ inputs.blue_green_suffix }}'
+            kubectl create deployment "$target_deployment" \
+              --image='${{ needs.build-push.outputs.image_tag }}' \
+              --namespace '${{ inputs.namespace }}' \
+              --dry-run=client -o yaml | kubectl apply -f -
+          fi
+
+          if [ '${{ inputs.deployment_strategy }}' = 'rolling' ]; then
+            kubectl set image deployment/"${target_deployment}" \
+              "${target_container}=${{ needs.build-push.outputs.image_tag }}" \
+              --namespace "${{ inputs.namespace }}"
+          fi
+          kubectl rollout status deployment/"${target_deployment}" \
             --namespace "${{ inputs.namespace }}" \
             --timeout="${{ inputs.health_timeout }}s"
+
+      - name: Run post-deploy command
+        if: inputs.post_deploy_command != ''
+        run: ${{ inputs.post_deploy_command }}
 
       - name: Cleanup kubeconfig
         if: always()
@@ -159,8 +268,8 @@ jobs:
 
   verify:
     name: Verify Deployment
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
-    needs: deploy
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
+    needs: [build-push, deploy]
     permissions:
       contents: read
     steps:
@@ -176,10 +285,17 @@ jobs:
           set -euo pipefail
           echo "## Deployment Verification" >> "$GITHUB_STEP_SUMMARY"
 
-          READY=$(kubectl get deployment "${{ inputs.deployment_name }}" \
+          TARGET_DEPLOYMENT='${{ inputs.deployment_name }}'
+          if [ '${{ inputs.deployment_strategy }}' = 'canary' ]; then
+            TARGET_DEPLOYMENT='${{ inputs.deployment_name }}-canary'
+          elif [ '${{ inputs.deployment_strategy }}' = 'blue-green' ]; then
+            TARGET_DEPLOYMENT='${{ inputs.deployment_name }}-${{ inputs.blue_green_suffix }}'
+          fi
+
+          READY=$(kubectl get deployment "$TARGET_DEPLOYMENT" \
             --namespace "${{ inputs.namespace }}" \
             -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-          DESIRED=$(kubectl get deployment "${{ inputs.deployment_name }}" \
+          DESIRED=$(kubectl get deployment "$TARGET_DEPLOYMENT" \
             --namespace "${{ inputs.namespace }}" \
             -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
 
@@ -189,11 +305,46 @@ jobs:
 
           if [ "$READY" != "$DESIRED" ] || [ "$READY" = "0" ]; then
             echo "::error::Deployment not healthy: $READY/$DESIRED replicas ready"
-            kubectl describe deployment "${{ inputs.deployment_name }}" --namespace "${{ inputs.namespace }}"
+            kubectl describe deployment "$TARGET_DEPLOYMENT" --namespace "${{ inputs.namespace }}"
             exit 1
           fi
 
           echo "Deployment verified: $READY/$DESIRED replicas ready"
+
+      - name: External health check
+        if: inputs.health_check_url != ''
+        run: |
+          set -euo pipefail
+          curl -fsSL '${{ inputs.health_check_url }}' >/dev/null
+
+      - name: Summary
+        if: always()
+        run: |
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image tag:** ${{ needs.build-push.outputs.image_tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image digest:** ${{ needs.build-push.outputs.image_digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Strategy:** ${{ inputs.deployment_strategy }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify webhook
+        if: always() && secrets.NOTIFY_WEBHOOK_URL != ''
+        env:
+          WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          payload=$(python3 - <<'PY'
+          import json
+          print(json.dumps({
+              'workflow': 'deploy-k8s',
+              'repository': '${{ github.repository }}',
+              'status': '${{ job.status }}',
+              'environment': '${{ inputs.environment_name }}',
+              'strategy': '${{ inputs.deployment_strategy }}',
+              'image_tag': '${{ needs.build-push.outputs.image_tag }}',
+              'image_digest': '${{ needs.build-push.outputs.image_digest }}',
+          }))
+          PY
+            )
+          curl -fsSL -X POST -H 'Content-Type: application/json' -d "$payload" "$WEBHOOK_URL"
 
       - name: Cleanup kubeconfig
         if: always()
@@ -202,7 +353,7 @@ jobs:
   rollback:
     name: Rollback
     if: failure() && inputs.rollback_on_failure && (needs.deploy.result == 'failure' || needs.verify.result == 'failure')
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     needs: [deploy, verify]
     permissions:
       contents: read
@@ -217,15 +368,22 @@ jobs:
       - name: Rollback deployment
         run: |
           set -euo pipefail
-          echo "::warning::Rolling back deployment ${{ inputs.deployment_name }}"
-          kubectl rollout undo deployment/"${{ inputs.deployment_name }}" \
+          TARGET_DEPLOYMENT='${{ inputs.deployment_name }}'
+          if [ '${{ inputs.deployment_strategy }}' = 'canary' ]; then
+            TARGET_DEPLOYMENT='${{ inputs.deployment_name }}-canary'
+          elif [ '${{ inputs.deployment_strategy }}' = 'blue-green' ]; then
+            TARGET_DEPLOYMENT='${{ inputs.deployment_name }}-${{ inputs.blue_green_suffix }}'
+          fi
+
+          echo "::warning::Rolling back deployment ${TARGET_DEPLOYMENT}"
+          kubectl rollout undo deployment/"${TARGET_DEPLOYMENT}" \
             --namespace "${{ inputs.namespace }}"
-          kubectl rollout status deployment/"${{ inputs.deployment_name }}" \
+          kubectl rollout status deployment/"${TARGET_DEPLOYMENT}" \
             --namespace "${{ inputs.namespace }}" \
             --timeout="${{ inputs.health_timeout }}s"
 
           echo "## Rollback Completed" >> "$GITHUB_STEP_SUMMARY"
-          echo "Deployment ${{ inputs.deployment_name }} rolled back to previous revision." >> "$GITHUB_STEP_SUMMARY"
+          echo "Deployment ${TARGET_DEPLOYMENT} rolled back to previous revision." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup kubeconfig
         if: always()

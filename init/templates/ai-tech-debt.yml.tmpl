@@ -1,0 +1,9 @@
+name: Tech Debt Scan
+on:
+  schedule:
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+jobs:
+  tech-debt:
+    uses: SevFle/devops-toolkit/.github/workflows/ai-tech-debt.yml@main
+    secrets: inherit

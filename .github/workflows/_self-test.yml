@@ -7,6 +7,7 @@ on:
       - 'orchestrator/**'
       - '.github/workflows/**'
       - 'actions/**'
+      - 'init/**'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
@@ -18,19 +19,75 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Install YAML parser
+        run: python3 -m pip install --disable-pip-version-check pyyaml
       - name: Validate YAML syntax
         run: |
+          set -euo pipefail
           FAILED=0
           for f in .github/workflows/*.yml actions/*/action.yml; do
             echo "Checking $f..."
-            python3 -c "
-          import yaml, sys
-          with open(sys.argv[1]) as fh:
-              yaml.safe_load(fh)
-          " "$f" || { echo "::error::Invalid YAML: $f"; FAILED=1; }
+            python3 - "$f" <<'PY' || { echo "::error::Invalid YAML: $f"; FAILED=1; }
+            import sys
+            import yaml
+
+            with open(sys.argv[1], 'r', encoding='utf-8') as fh:
+                yaml.safe_load(fh)
+            PY
           done
           [ "$FAILED" -eq 0 ] && echo "All YAML files are valid"
-          exit $FAILED
+          exit "$FAILED"
+
+  template-parity:
+    name: Template Parity
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify reusable workflow templates exist
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          workflow_to_template = {
+            'ci.yml': 'ci.yml.tmpl',
+            'e2e.yml': 'e2e.yml.tmpl',
+            'release.yml': 'release.yml.tmpl',
+            'rollback.yml': 'rollback.yml.tmpl',
+            'deploy-staging.yml': 'deploy-staging.yml.tmpl',
+            'deploy-production.yml': 'deploy-production.yml.tmpl',
+            'deploy-k8s.yml': 'deploy-k8s.yml.tmpl',
+            'security.yml': 'security.yml.tmpl',
+            'pr-quality.yml': 'pr-quality.yml.tmpl',
+            'ci-heal.yml': 'ci-heal.yml.tmpl',
+            'housekeeping.yml': 'housekeeping.yml.tmpl',
+            'openspec-interview.yml': 'openspec-interview.yml.tmpl',
+            'openspec-propose.yml': 'openspec-propose.yml.tmpl',
+            'openspec-orchestrate.yml': 'openspec-orchestrate.yml.tmpl',
+            'ai-code-review.yml': 'ai-code-review.yml.tmpl',
+            'ai-owasp-audit.yml': 'ai-owasp-audit.yml.tmpl',
+            'ai-perf-audit.yml': 'ai-perf-audit.yml.tmpl',
+            'ai-test-gaps.yml': 'ai-test-gaps.yml.tmpl',
+            'ai-dead-code.yml': 'ai-dead-code.yml.tmpl',
+            'ai-release-notes.yml': 'ai-release-notes.yml.tmpl',
+            'ai-api-compat.yml': 'ai-api-compat.yml.tmpl',
+            'ai-tech-debt.yml': 'ai-tech-debt.yml.tmpl',
+            'codeql.yml': 'codeql.yml.tmpl',
+          }
+
+          template_dir = Path('init/templates')
+          missing = [f'{wf} -> {tmpl}' for wf, tmpl in workflow_to_template.items() if not (template_dir / tmpl).exists()]
+          allowed = set(workflow_to_template.values()) | {'ci-go.yml.tmpl', 'ci-python.yml.tmpl'}
+          unexpected = sorted(path.name for path in template_dir.glob('*.tmpl') if path.name not in allowed)
+
+          if missing:
+            raise SystemExit('Missing templates:\n' + '\n'.join(missing))
+          if unexpected:
+            raise SystemExit('Unexpected templates without parity mapping:\n' + '\n'.join(unexpected))
+
+          print('Workflow/template parity looks good.')
+          PY
 
   test-orchestrator:
     name: Orchestrator Tests
@@ -52,7 +109,47 @@ jobs:
     name: Init Script
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project:
+          - name: node
+            marker_file: package.json
+            marker_content: '{"name":"demo","version":"1.0.0"}'
+            expected_ci: "runtime: 'node'"
+          - name: python
+            marker_file: pyproject.toml
+            marker_content: '[project]\nname = "demo"\nversion = "0.1.0"\n'
+            expected_ci: "runtime: 'python'"
+          - name: go
+            marker_file: go.mod
+            marker_content: 'module example.com/demo\n\ngo 1.22\n'
+            expected_ci: "runtime: 'go'"
     steps:
       - uses: actions/checkout@v6
       - name: Verify init.sh syntax
         run: bash -n init/init.sh
+      - name: Scaffold sample project locally
+        env:
+          DEVOPS_TOOLKIT_LOCAL_ROOT: ${{ github.workspace }}
+          EXPECTED_CI: ${{ matrix.project.expected_ci }}
+          MARKER_FILE: ${{ matrix.project.marker_file }}
+          MARKER_CONTENT: ${{ matrix.project.marker_content }}
+        run: |
+          set -euo pipefail
+          WORKDIR=$(mktemp -d)
+          cd "$WORKDIR"
+          git init -b main >/dev/null 2>&1
+          printf '%s' "$MARKER_CONTENT" > "$MARKER_FILE"
+
+          printf 'y\nn\ny\ny\nn\nn\nn\nn\nn\nn\nn\nn\nn\nn\nn\n' | bash "$GITHUB_WORKSPACE/init/init.sh"
+
+          test -f .github/workflows/ci.yml
+          test -f .github/workflows/security.yml
+          test -f .github/workflows/pr-quality.yml
+          grep -F "$EXPECTED_CI" .github/workflows/ci.yml
+
+          if grep -R '{{[A-Z_][A-Z_]*}}' .github/workflows; then
+            echo '::error::Found unresolved template variables'
+            exit 1
+          fi

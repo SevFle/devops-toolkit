@@ -19,10 +19,22 @@ on:
         type: boolean
         default: false
         description: 'Require CHANGELOG.md to be modified'
+      require_linked_issue:
+        type: boolean
+        default: false
+        description: 'Require the PR title or body to reference an issue'
+      required_labels:
+        type: string
+        default: ''
+        description: 'Comma-separated labels that must be present on the PR'
       branch_pattern:
         type: string
         default: ''
         description: 'Regex pattern for valid branch names'
+      security_checklist_paths:
+        type: string
+        default: ''
+        description: 'Comma-separated globs that require a security checklist acknowledgement'
       runners:
         type: string
         default: 'self-hosted'
@@ -31,7 +43,7 @@ on:
 jobs:
   quality-gate:
     name: Quality Gate
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     permissions:
       contents: read
       pull-requests: write
@@ -46,13 +58,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
           PR_BRANCH: ${{ github.head_ref }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          REPO: ${{ github.repository }}
           MAX_LINES_WARN: ${{ inputs.max_lines_warn }}
           MAX_LINES_BLOCK: ${{ inputs.max_lines_block }}
           REQUIRE_CONVENTIONAL: ${{ inputs.require_conventional_commits }}
           REQUIRE_CHANGELOG: ${{ inputs.require_changelog }}
+          REQUIRE_LINKED_ISSUE: ${{ inputs.require_linked_issue }}
+          REQUIRED_LABELS: ${{ inputs.required_labels }}
           BRANCH_PATTERN: ${{ inputs.branch_pattern }}
+          SECURITY_CHECKLIST_PATHS: ${{ inputs.security_checklist_paths }}
         run: |
           set -euo pipefail
 
@@ -97,6 +114,36 @@ jobs:
             fi
           fi
 
+          # --- Linked issue check ---
+          if [ "$REQUIRE_LINKED_ISSUE" = "true" ]; then
+            if printf '%s\n%s' "$PR_TITLE" "$PR_BODY" | grep -Eiq '(^|[^A-Za-z0-9])#([0-9]+)\b|\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#([0-9]+)\b'; then
+              COMMENT="$COMMENT\n| Linked Issue | PASS | Issue reference found in title or body |"
+            else
+              COMMENT="$COMMENT\n| Linked Issue | FAIL | Add an issue reference such as Fixes #123 |"
+              FAILED=true
+            fi
+          fi
+
+          # --- Required labels check ---
+          if [ -n "$REQUIRED_LABELS" ]; then
+            PRESENT_LABELS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name' 2>/dev/null || true)
+            IFS=',' read -ra REQUIRED_LABEL_LIST <<< "$REQUIRED_LABELS"
+            MISSING_LABELS=()
+            for raw_label in "${REQUIRED_LABEL_LIST[@]}"; do
+              label=$(echo "$raw_label" | xargs)
+              if [ -n "$label" ] && ! echo "$PRESENT_LABELS" | grep -Fxq "$label"; then
+                MISSING_LABELS+=("$label")
+              fi
+            done
+
+            if [ "${#MISSING_LABELS[@]}" -eq 0 ]; then
+              COMMENT="$COMMENT\n| Required Labels | PASS | All required labels are present |"
+            else
+              COMMENT="$COMMENT\n| Required Labels | FAIL | Missing: ${MISSING_LABELS[*]} |"
+              FAILED=true
+            fi
+          fi
+
           # --- Branch name check ---
           if [ -n "$BRANCH_PATTERN" ]; then
             if echo "$PR_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
@@ -104,6 +151,30 @@ jobs:
             else
               COMMENT="$COMMENT\n| Branch Name | FAIL | Branch '$PR_BRANCH' does not match pattern '$BRANCH_PATTERN' |"
               FAILED=true
+            fi
+          fi
+
+          # --- Security checklist for risky files ---
+          if [ -n "$SECURITY_CHECKLIST_PATHS" ]; then
+            CHANGED_FILES=$(gh pr diff "$PR_NUMBER" --name-only)
+            if CHANGED_FILES="$CHANGED_FILES" python3 - <<'PY'
+            from fnmatch import fnmatch
+            import os
+
+            files = [line.strip() for line in os.environ.get('CHANGED_FILES', '').splitlines() if line.strip()]
+            patterns = [item.strip() for item in os.environ.get('SECURITY_CHECKLIST_PATHS', '').split(',') if item.strip()]
+            needs_checklist = any(any(fnmatch(path, pattern) for pattern in patterns) for path in files)
+            raise SystemExit(0 if needs_checklist else 1)
+            PY
+            then
+              if printf '%s' "$PR_BODY" | grep -Fqi -- '- [x] security reviewed'; then
+                COMMENT="$COMMENT\n| Risky Change Checklist | PASS | Security checklist acknowledged in PR body |"
+              else
+                COMMENT="$COMMENT\n| Risky Change Checklist | FAIL | Risky files changed; add '- [x] Security reviewed' to the PR body |"
+                FAILED=true
+              fi
+            else
+              COMMENT="$COMMENT\n| Risky Change Checklist | PASS | No risky paths were changed |"
             fi
           fi
 

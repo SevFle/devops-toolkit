@@ -1,4 +1,4 @@
-name: AI Code Review
+name: API Compatibility
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -7,7 +7,7 @@ on:
       - 'docs/**'
       - '.github/ISSUE_TEMPLATE/**'
 jobs:
-  review:
+  compat:
     if: ${{ !github.event.pull_request.draft }}
-    uses: SevFle/devops-toolkit/.github/workflows/ai-code-review.yml@main
+    uses: SevFle/devops-toolkit/.github/workflows/ai-api-compat.yml@main
     secrets: inherit

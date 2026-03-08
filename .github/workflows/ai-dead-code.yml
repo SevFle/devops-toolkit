@@ -31,7 +31,7 @@ permissions:
 jobs:
   dead-code-analysis:
     name: Dead Code Analysis
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6

@@ -11,6 +11,10 @@ on:
         type: boolean
         default: false
         description: 'Whether to scan Docker image with Trivy'
+      generate_sbom:
+        type: boolean
+        default: true
+        description: 'Generate a CycloneDX SBOM artifact'
       ignore_paths:
         type: string
         default: ''
@@ -19,11 +23,14 @@ on:
         type: string
         default: 'self-hosted'
         description: 'Runner label(s), JSON array or string'
+    secrets:
+      NOTIFY_WEBHOOK_URL:
+        required: false
 
 jobs:
   secret-detection:
     name: Secret Detection
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     permissions:
       contents: read
       pull-requests: read
@@ -32,6 +39,22 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Apply ignore paths
+        if: inputs.ignore_paths != ''
+        shell: bash
+        env:
+          IGNORE_PATHS: ${{ inputs.ignore_paths }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra PATHS <<< "$IGNORE_PATHS"
+          for path in "${PATHS[@]}"; do
+            trimmed=$(echo "$path" | xargs)
+            if [ -n "$trimmed" ] && [ -e "$trimmed" ]; then
+              echo "Removing ignored path from scan workspace: $trimmed"
+              rm -rf "$trimmed"
+            fi
+          done
 
       - name: Clean stale gitleaks artifacts
         run: rm -f /tmp/gitleaks.tmp /tmp/gitleaks-*.tar.gz
@@ -53,12 +76,27 @@ jobs:
 
   dependency-audit:
     name: Dependency Audit
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     permissions:
       contents: read
       security-events: write
     steps:
       - uses: actions/checkout@v6
+
+      - name: Apply ignore paths
+        if: inputs.ignore_paths != ''
+        shell: bash
+        env:
+          IGNORE_PATHS: ${{ inputs.ignore_paths }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra PATHS <<< "$IGNORE_PATHS"
+          for path in "${PATHS[@]}"; do
+            trimmed=$(echo "$path" | xargs)
+            if [ -n "$trimmed" ] && [ -e "$trimmed" ]; then
+              rm -rf "$trimmed"
+            fi
+          done
 
       - name: Detect project type
         id: detect
@@ -103,7 +141,7 @@ jobs:
   container-scan:
     name: Container Scan
     if: inputs.scan_docker
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     permissions:
       contents: read
       actions: read
@@ -121,7 +159,7 @@ jobs:
           tags: scan-target:latest
 
       - name: Run Trivy
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         with:
           image-ref: 'scan-target:latest'
           format: 'sarif'
@@ -135,13 +173,36 @@ jobs:
           sarif_file: trivy-results.sarif
           category: container-scan
 
+  sbom:
+    name: SBOM
+    if: inputs.generate_sbom
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: cyclonedx
+          output: sbom.cdx.json
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-sbom
+          path: sbom.cdx.json
+          retention-days: 7
+
   security-status:
     name: Security Status
     if: always()
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
-    needs: [secret-detection, dependency-audit, container-scan]
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
+    needs: [secret-detection, dependency-audit, container-scan, sbom]
     steps:
       - name: Check results
+        id: status
         run: |
           set -euo pipefail
           echo "## Security Scan Summary" >> "$GITHUB_STEP_SUMMARY"
@@ -150,16 +211,54 @@ jobs:
           echo "| Secret Detection | ${{ needs.secret-detection.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Dependency Audit | ${{ needs.dependency-audit.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Container Scan | ${{ needs.container-scan.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SBOM | ${{ needs.sbom.result }} |" >> "$GITHUB_STEP_SUMMARY"
+
+          overall='success'
 
           if [[ "${{ needs.secret-detection.result }}" == "failure" ]] || \
              [[ "${{ needs.dependency-audit.result }}" == "failure" ]]; then
+            overall='failure'
             echo "::error::Security checks failed"
-            exit 1
           fi
 
           if [[ "${{ needs.container-scan.result }}" == "failure" ]]; then
+            overall='failure'
             echo "::error::Container scan failed"
+          fi
+
+          if [[ "${{ inputs.generate_sbom }}" == "true" ]] && [[ "${{ needs.sbom.result }}" == "failure" ]]; then
+            overall='failure'
+            echo "::error::SBOM generation failed"
+          fi
+
+          echo "overall=$overall" >> "$GITHUB_OUTPUT"
+
+          if [[ "$overall" == 'failure' ]]; then
             exit 1
           fi
 
           echo "All security checks passed!"
+
+      - name: Notify webhook
+        if: always() && secrets.NOTIFY_WEBHOOK_URL != ''
+        env:
+          WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          payload=$(python3 - <<'PY'
+          import json
+
+          payload = {
+              'workflow': 'security',
+              'repository': '${{ github.repository }}',
+              'run_id': '${{ github.run_id }}',
+              'status': '${{ steps.status.outputs.overall }}',
+              'secret_detection': '${{ needs.secret-detection.result }}',
+              'dependency_audit': '${{ needs.dependency-audit.result }}',
+              'container_scan': '${{ needs.container-scan.result }}',
+              'sbom': '${{ needs.sbom.result }}',
+          }
+          print(json.dumps(payload))
+          PY
+            )
+          curl -fsSL -X POST -H 'Content-Type: application/json' -d "$payload" "$WEBHOOK_URL"

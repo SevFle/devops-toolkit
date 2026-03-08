@@ -1,0 +1,13 @@
+name: AI Release Notes
+on:
+  workflow_dispatch:
+    inputs:
+      since_tag:
+        description: 'Optional tag to generate notes from'
+        required: false
+jobs:
+  notes:
+    uses: SevFle/devops-toolkit/.github/workflows/ai-release-notes.yml@main
+    with:
+      since_tag: ${{ inputs.since_tag }}
+    secrets: inherit

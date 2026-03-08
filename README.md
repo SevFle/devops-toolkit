@@ -21,25 +21,26 @@ All workflows are reusable via `workflow_call`. Caller repos invoke them with th
 
 | Workflow | Description | Trigger |
 |----------|-------------|---------|
-| `ci.yml` | Parallel lint, type-check, test, build, and optional Docker validation. Supports test report publishing with coverage delta via the `test-report` composite action. | `workflow_call` |
+| `ci.yml` | Runtime-aware CI for Node.js, Python, and Go with path-based short-circuiting, optional E2E execution, flaky-test retry detection, and coverage enforcement via the `test-report` composite action. | `workflow_call` |
 | `e2e.yml` | Playwright E2E tests with configurable browser matrix, custom start command, and artifact uploads. | `workflow_call` |
-| `release.yml` | Semantic version bump, run full test suite, create git tag + GitHub Release. Optionally generates AI-powered release notes via `ai-release-notes.yml`. | `workflow_call` |
+| `release.yml` | Semantic version bump, run the full verification suite, create git tag + GitHub Release, and support dry runs plus optional AI-generated release notes. | `workflow_call` |
 
 ### Deploy
 
 | Workflow | Description | Trigger |
 |----------|-------------|---------|
-| `deploy-staging.yml` | Build Docker image, transfer to VPS via SSH, deploy with docker-compose, and health-check. Auto-increments beta version tags. | `workflow_call` |
-| `deploy-production.yml` | Production deploy to VPS from a published release or manual dispatch. Same Docker + SSH pattern as staging. | `workflow_call` |
-| `deploy-k8s.yml` | Kubernetes-native deploy: build and push image to registry (GHCR/ECR/GCR), deploy via Helm, Kustomize, or `kubectl set image`, verify rollout, and auto-rollback on failure. | `workflow_call` |
+| `deploy-staging.yml` | Build Docker image, transfer to VPS via SSH, deploy with docker-compose, run optional pre/post hooks, and health-check with retries. Auto-increments beta version tags and supports environment protection. | `workflow_call` |
+| `deploy-production.yml` | Production deploy to VPS from a published release or manual dispatch using immutable image references, optional migration hooks, environment protection, and webhook notifications. | `workflow_call` |
+| `deploy-k8s.yml` | Kubernetes-native deploy with provenance attestation, optional Cosign signing, Helm/Kustomize or kubectl rollout strategies, rollout verification, webhook notifications, and auto-rollback on failure. | `workflow_call` |
 | `rollback.yml` | Rollback staging or production to a previous Docker image tag on VPS. | `workflow_call` |
 
 ### Security & Quality
 
 | Workflow | Description | Trigger |
 |----------|-------------|---------|
-| `security.yml` | Three parallel scans: secret detection (gitleaks), dependency audit (auto-detects npm/pip/go), and container scanning (Trivy). Uploads SARIF to GitHub Security tab. | `workflow_call` |
-| `pr-quality.yml` | PR hygiene gate: diff size limits (warn/block thresholds), conventional commit title validation, optional changelog enforcement, and branch naming patterns. Posts pass/fail summary comment. | `workflow_call` |
+| `security.yml` | Secret detection, dependency audit, optional container scanning, CycloneDX SBOM generation, SARIF uploads, path ignores, and webhook notifications. | `workflow_call` |
+| `pr-quality.yml` | PR hygiene gate: diff size limits, conventional commit title validation, optional changelog and linked-issue enforcement, required labels, risky-file checklists, and branch naming patterns. Posts a pass/fail summary comment. | `workflow_call` |
+| `codeql.yml` | GitHub CodeQL analysis with auto or explicit language selection, custom build hooks, and Security tab upload for semantic code scanning. | `workflow_call` |
 
 ### Self-Healing CI
 
@@ -60,6 +61,7 @@ AI-driven feature implementation from issue to PR:
 | Workflow | Description | Trigger |
 |----------|-------------|---------|
 | `openspec-interview.yml` | Multi-turn interview bot on GitHub issues. Claude asks clarifying questions, tracks state in base64 comment markers, and determines when the interview is complete. | `workflow_call` |
+| `openspec-propose.yml` | Converts a `/propose` issue comment into an OpenSpec proposal branch, draft artifacts, and follow-up PR workflow state. | `workflow_call` |
 | `openspec-orchestrate.yml` | Drives Claude CLI in a retry loop to implement an OpenSpec change: creates branch, runs implementation attempts, reviews code, commits progress, and opens a PR. | `workflow_call` |
 
 ### AI-Powered Analysis
@@ -258,7 +260,25 @@ jobs:
     uses: SevFle/devops-toolkit/.github/workflows/security.yml@main
     with:
       scan_docker: true
+      generate_sbom: true
       severity_threshold: high
+    secrets: inherit
+```
+
+### CodeQL Analysis
+
+```yaml
+name: CodeQL
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  analyze:
+    uses: SevFle/devops-toolkit/.github/workflows/codeql.yml@main
+    with:
+      language: auto
+      query_suite: security-and-quality
     secrets: inherit
 ```
 
@@ -353,6 +373,20 @@ jobs:
     secrets: inherit
 ```
 
+```yaml
+# Proposal generator (triggered by /propose comments)
+name: OpenSpec Propose
+on:
+  issue_comment:
+    types: [created]
+jobs:
+  propose:
+    uses: SevFle/devops-toolkit/.github/workflows/openspec-propose.yml@main
+    with:
+      base_branch: main
+    secrets: inherit
+```
+
 ### Housekeeping
 
 ```yaml
@@ -399,9 +433,11 @@ jobs:
   rollback.yml              # VPS rollback
   security.yml              # Secret detection + dep audit + container scan
   pr-quality.yml            # PR size, commit format, changelog checks
+  codeql.yml                # Semantic security scanning via CodeQL
   ci-heal.yml               # Auto-fix CI failures with Claude
   housekeeping.yml          # Stale issue/PR/branch cleanup
   openspec-interview.yml    # AI interview bot on issues
+  openspec-propose.yml      # Proposal generation from /propose comments
   openspec-orchestrate.yml  # AI-driven implementation loop
   ai-owasp-audit.yml        # OWASP Top 20 security audit
   ai-code-review.yml        # AI PR code review

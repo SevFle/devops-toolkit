@@ -35,7 +35,7 @@ on:
 
 jobs:
   orchestrate:
-    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
 
     steps:

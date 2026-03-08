@@ -1,0 +1,9 @@
+name: Dead Code Analysis
+on:
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+jobs:
+  analyze:
+    uses: SevFle/devops-toolkit/.github/workflows/ai-dead-code.yml@main
+    secrets: inherit

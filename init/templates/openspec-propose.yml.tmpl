@@ -1,0 +1,10 @@
+name: OpenSpec Propose
+on:
+  issue_comment:
+    types: [created]
+jobs:
+  propose:
+    uses: SevFle/devops-toolkit/.github/workflows/openspec-propose.yml@main
+    with:
+      base_branch: {{BASE_BRANCH}}
+    secrets: inherit
