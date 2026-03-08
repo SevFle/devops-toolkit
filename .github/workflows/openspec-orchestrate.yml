@@ -31,7 +31,7 @@ on:
         default: 'self-hosted'
     secrets:
       PAT_TOKEN:
-        required: true
+        required: false
 
 jobs:
   orchestrate:
