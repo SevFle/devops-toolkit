@@ -5,8 +5,8 @@ on:
     inputs:
       ai_model:
         type: string
-        default: 'claude-sonnet-4-5-20250514'
-        description: 'Claude model for interview'
+        default: 'zai-coding-plan/glm-5'
+        description: 'Model for interview (opencode provider/model format)'
       max_questions:
         type: number
         default: 15
@@ -213,17 +213,16 @@ jobs:
             printf 'Ask in the SAME LANGUAGE as the issue.\n'
           } >> /tmp/interview-prompt.md
 
-      - name: Run Claude Interview Agent
+      - name: Run Interview Agent
         id: claude
         continue-on-error: true
         if: steps.label-check.outputs.should_run == 'true' && steps.label-check.outputs.has_interview_finished_label != 'true'
+        env:
+          AI_MODEL: ${{ inputs.ai_model }}
         run: |
           RESPONSE_FILE=$(mktemp)
-          cat /tmp/interview-prompt.md | claude -p \
-            --model "${{ inputs.ai_model }}" \
-            --max-turns 1 \
-            --allowedTools "" \
-            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+          PROMPT=$(cat /tmp/interview-prompt.md)
+          opencode run -m "$AI_MODEL" "$PROMPT" > "$RESPONSE_FILE" 2>&1 || true
           RESPONSE=$(cat "$RESPONSE_FILE")
           QUESTION_STEP=$(echo "$RESPONSE" | grep -oP 'OPENSPEC_QUESTION_STEP:\s*\K\d+' | head -1 || true)
           echo "question_step=$QUESTION_STEP" >> $GITHUB_OUTPUT
