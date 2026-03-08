@@ -11,11 +11,11 @@ from pathlib import Path
 class Config:
     """Immutable orchestrator configuration."""
 
-    max_implementation_attempts: int = 5
-    max_review_cycles: int = 3
+    max_implementation_attempts: int = 25
+    max_review_cycles: int = 23
     claude_timeout: int = 1800  # 30 minutes
     review_timeout: int = 600  # 10 minutes
-    db_path: Path = Path.home() / ".orchestrator" / "history.db"
+    db_path: Path = Path.home() / "...orchestrator" / "history.db"
     github_token: str = ""
     max_consecutive_no_progress: int = 2
     time_budget_seconds: int = 6600  # 110 minutes (leaves 10 min buffer for 2h GHA timeout)
@@ -31,8 +31,8 @@ class Config:
             return int(float(raw))
 
         return cls(
-            max_implementation_attempts=_int_env("ORCHESTRATOR_MAX_ATTEMPTS", "5"),
-            max_review_cycles=_int_env("ORCHESTRATOR_MAX_REVIEW_CYCLES", "3"),
+            max_implementation_attempts=_int_env("ORCHESTRATOR_MAX_ATTEMPTS", "25"),
+            max_review_cycles=_int_env("ORCHESTRATOR_MAX_REVIEW_CYCLES", "23"),
             claude_timeout=_int_env("ORCHESTRATOR_CLAUDE_TIMEOUT", "1800"),
             review_timeout=_int_env("ORCHESTRATOR_REVIEW_TIMEOUT", "600"),
             db_path=Path(
