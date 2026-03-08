@@ -1,0 +1,339 @@
+name: OpenSpec Propose
+
+on:
+  workflow_call:
+    inputs:
+      ai_model:
+        type: string
+        default: 'zai-coding-plan/glm-5'
+        description: 'Model for proposal generation (opencode provider/model format)'
+      base_branch:
+        type: string
+        default: 'develop'
+        description: 'Base branch for feature branches'
+      runners:
+        type: string
+        default: 'self-hosted'
+      timeout_minutes:
+        type: number
+        default: 30
+    secrets:
+      PAT_TOKEN:
+        required: true
+
+concurrency:
+  group: openspec-propose-${{ github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  openspec-propose:
+    if: >-
+      github.event.comment.user.type != 'Bot'
+      && !github.event.issue.pull_request
+      && startsWith(github.event.comment.body, '/propose')
+    runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.base_branch }}
+
+      - name: Checkout devops-toolkit
+        uses: actions/checkout@v6
+        with:
+          repository: SevFle/devops-toolkit
+          path: .devops-toolkit
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "openspec-auto[bot]"
+          git config --global user.email "openspec-auto[bot]@users.noreply.github.com"
+
+      - name: Clear git auth header
+        run: git config --local --unset-all http.https://github.com/.extraheader || true
+
+      - name: Validate commenter permissions
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.payload.comment.user.login
+            });
+            const allowed = ['admin', 'write', 'maintain'];
+            if (!allowed.includes(data.permission)) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `@${context.payload.comment.user.login} You need write access to use \`/propose\`.`
+              });
+              core.setFailed('Insufficient permissions');
+            }
+
+      - name: Validate labels
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            const hasLabel = issue.labels.some(l => l.name === 'interview finished');
+            if (!hasLabel) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: 'Cannot run `/propose` — this issue needs the `interview finished` label first.'
+              });
+              core.setFailed('Missing "interview finished" label');
+            }
+
+      - name: Derive change name and check idempotency
+        id: derive
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          TITLE=$(gh issue view "$ISSUE_NUMBER" --json title -q '.title')
+          CHANGE_NAME=$(echo "$TITLE" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9 ]//g' \
+            | sed 's/  */ /g' \
+            | sed 's/ /-/g' \
+            | cut -c1-50 \
+            | sed 's/-$//')
+
+          echo "change_name=$CHANGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "branch_name=openspec/$CHANGE_NAME" >> "$GITHUB_OUTPUT"
+
+          EXISTING_PR=$(gh pr list \
+            --head "openspec/$CHANGE_NAME" \
+            --state open \
+            --json number,url \
+            -q '.[0].url // empty' 2>/dev/null || true)
+
+          if [ -n "$EXISTING_PR" ]; then
+            gh issue comment "$ISSUE_NUMBER" \
+              --body "A proposal PR already exists for this issue: $EXISTING_PR"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect interview context
+        if: steps.derive.outputs.skip != 'true'
+        id: context
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          CONTEXT_FILE=$(mktemp)
+          echo "context_file=$CONTEXT_FILE" >> "$GITHUB_OUTPUT"
+
+          ISSUE_JSON=$(gh issue view "$ISSUE_NUMBER" --json title,body)
+          ISSUE_TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
+          ISSUE_BODY=$(echo "$ISSUE_JSON" | jq -r '.body // ""')
+
+          {
+            echo "# Issue: $ISSUE_TITLE"
+            echo ""
+            echo "## Issue Description"
+            echo "$ISSUE_BODY"
+            echo ""
+            echo "## Interview Q&A"
+          } > "$CONTEXT_FILE"
+
+          gh api \
+            "repos/$REPO/issues/$ISSUE_NUMBER/comments" \
+            --paginate \
+            --jq '.[] | {user_type: .user.type, body: .body}' \
+          | jq -rs '
+            . as $comments |
+            reduce range(length) as $i (
+              {pairs: [], current_q: null};
+              if $comments[$i].user_type == "Bot" then
+                ($comments[$i].body | capture("### (?<q>[^\n]+)") // null) as $match |
+                if $match then .current_q = $match.q else . end
+              elif $comments[$i].user_type != "Bot" then
+                ($comments[$i].body | capture("^\\s*/interview\\s+(?<a>[\\s\\S]+)") // null) as $match |
+                if $match and .current_q then
+                  .pairs += [{q: .current_q, a: ($match.a | ltrimstr("\n") | rtrimstr("\n"))}] |
+                  .current_q = null
+                else . end
+              else . end
+            ) | .pairs[] | "### Q: \(.q)\n**Answer:** \(.a)\n"
+          ' >> "$CONTEXT_FILE" 2>/dev/null || true
+
+      - name: Scaffold change directory
+        if: steps.derive.outputs.skip != 'true'
+        env:
+          CHANGE_NAME: ${{ steps.derive.outputs.change_name }}
+        run: |
+          mkdir -p "openspec/changes/$CHANGE_NAME/specs"
+
+      - name: Prepare propose prompt
+        if: steps.derive.outputs.skip != 'true'
+        env:
+          CHANGE_NAME: ${{ steps.derive.outputs.change_name }}
+          CONTEXT_FILE: ${{ steps.context.outputs.context_file }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          INTERVIEW_CONTEXT=$(cat "$CONTEXT_FILE")
+
+          cat > /tmp/propose-prompt.md <<PROMPT_EOF
+          You are generating an OpenSpec proposal for a software project.
+
+          ## Task
+          1. Read the GitHub issue and interview context provided below
+          2. Explore relevant codebase areas to understand existing architecture
+          3. Generate OpenSpec artifacts and save them to: openspec/changes/${CHANGE_NAME}/
+             - proposal.md (problem statement, scope, proposed solution)
+             - design.md (technical design, components, data flow)
+             - specs/ directory with spec files per capability
+             - tasks.md (actionable implementation tasks)
+          4. Do NOT spend more than 3 messages exploring before starting artifact creation
+          5. Change the label of issue #${ISSUE_NUMBER} from "interview finished" to "Spec proposed" using gh cli:
+             gh issue edit ${ISSUE_NUMBER} --remove-label "interview finished" --add-label "Spec proposed" --repo ${REPO}
+
+          ## Interview Context
+
+          ${INTERVIEW_CONTEXT}
+
+          ## Important
+          - Write artifacts in the SAME LANGUAGE as the issue (German if German, English if English)
+          - Be specific and actionable — reference actual files, components, and patterns from the codebase
+          - Each spec should have clear acceptance criteria
+          - Tasks should be ordered by dependency and sized for individual PRs
+          PROMPT_EOF
+
+      - name: Encode prompt
+        if: steps.derive.outputs.skip != 'true'
+        id: prompt-encode
+        run: |
+          echo "prompt_b64=$(base64 -w0 /tmp/propose-prompt.md)" >> $GITHUB_OUTPUT
+
+      - name: Run Propose Agent
+        id: opencode
+        continue-on-error: true
+        if: steps.derive.outputs.skip != 'true'
+        uses: ./.devops-toolkit/actions/opencode-run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: ${{ inputs.ai_model }}
+          use_github_token: "true"
+          prompt: ${{ steps.prompt-encode.outputs.prompt_b64 }}
+          is_encoded: "true"
+          timeout: "900"
+
+      - name: Commit and push
+        if: steps.derive.outputs.skip != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          CHANGE_NAME: ${{ steps.derive.outputs.change_name }}
+          BRANCH_NAME: ${{ steps.derive.outputs.branch_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          CHANGE_DIR="openspec/changes/$CHANGE_NAME"
+
+          if [ ! -d "$CHANGE_DIR" ] || [ -z "$(ls -A "$CHANGE_DIR" 2>/dev/null)" ]; then
+            echo "::error::No artifacts generated in $CHANGE_DIR"
+            exit 1
+          fi
+
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+          git checkout -b "$BRANCH_NAME"
+          git add "$CHANGE_DIR/"
+          git commit -m "docs: generate OpenSpec artifacts for $CHANGE_NAME"
+          git push -u origin "$BRANCH_NAME"
+
+      - name: Create draft PR
+        if: steps.derive.outputs.skip != 'true'
+        id: pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          CHANGE_NAME: ${{ steps.derive.outputs.change_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+        run: |
+          set -euo pipefail
+          PR_URL=$(gh pr create \
+            --base "$BASE_BRANCH" \
+            --draft \
+            --title "docs: OpenSpec artifacts for $CHANGE_NAME" \
+            --body "$(cat <<EOF
+          ## OpenSpec Proposal
+
+          Auto-generated artifacts from issue #${ISSUE_NUMBER}.
+
+          ### Artifacts
+          - proposal.md
+          - design.md
+          - specs/
+          - tasks.md
+
+          ### Review Checklist
+          - [ ] Proposal captures the problem and scope correctly
+          - [ ] Design is technically sound
+          - [ ] Specs have clear acceptance criteria
+          - [ ] Tasks are actionable and properly scoped
+
+          Resolves #${ISSUE_NUMBER}
+          EOF
+          )")
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Post success comment
+        if: steps.derive.outputs.skip != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PR_URL: ${{ steps.pr.outputs.pr_url }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" \
+            --body "OpenSpec artifacts generated! Draft PR: $PR_URL
+
+          Please review the proposal, design, specs, and tasks, then mark the PR ready for review."
+
+      - name: Handle errors
+        if: failure()
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: [
+                  'The `/propose` workflow failed.',
+                  '',
+                  `[View workflow run](${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${context.runId})`,
+                  '',
+                  'Check the logs for details and try again.'
+                ].join('\n')
+              });
+            } catch (error) {
+              console.log('Failed to post error comment:', error.message);
+            }
