@@ -34,6 +34,15 @@ For each category above:
 4. Examine dependency manifests for known vulnerable packages
 5. Look for hardcoded secrets, tokens, or credentials
 
+## Evidence Standard
+
+- Report only findings with a concrete exploit path, misconfiguration, or policy gap visible in the provided code/config
+- Use repo-relative file paths and the nearest justified line number
+- Prefer one high-signal finding per root cause rather than many duplicates
+- Include the input source and dangerous sink when relevant
+- If exploitability or reachability is uncertain, omit the finding instead of speculating
+- Max findings: 25
+
 ## Filtering
 
 CATEGORIES_FILTER: {{CATEGORIES}}
@@ -54,15 +63,22 @@ Output ONLY valid JSON between ```json and ``` markers. No other text before or 
     "file": "path/to/file.ext",
     "line": 42,
     "description": "Concise description of the vulnerability",
-    "recommendation": "Specific remediation with code snippet if applicable"
+    "recommendation": "Specific remediation with code snippet if applicable",
+    "confidence": "high|medium",
+    "input_source": "request.params.userId",
+    "dangerous_sink": "db.users.findUnique({ where: { id: userId } })",
+    "exploit_path": "Attacker supplies another user's ID and receives unauthorized data",
+    "why_it_matters": "Exposes cross-tenant data without authorization checks"
   }
 ]
 ```
 
 Rules:
-- Provide concrete file:line references - never say "somewhere in the code"
+- Provide concrete repo-relative `file:line` references - never say "somewhere in the code"
 - Include remediation code snippets showing the fix
 - Severity levels: critical (exploitable RCE/auth bypass), high (data exposure, injection), medium (misconfig, missing headers), low (informational, best practice)
+- `confidence` must be `high` or `medium`; do not emit low-confidence findings
+- `input_source`, `dangerous_sink`, and `exploit_path` should be included whenever the vulnerability involves attacker-controlled input flowing to a sensitive operation
 - If no findings for a category, omit it from the output
 - If no findings at all, output an empty array: `[]`
 - Output ONLY the JSON block - no commentary, no explanations outside the JSON

@@ -48,6 +48,10 @@ Analyze the following categories (based on the `categories` filter):
 - Consider dynamic imports, reflection, and framework conventions (decorators, hooks, etc.)
 - For each finding, explain WHY it appears to be dead code
 - Group findings by category
+- Use repo-relative paths everywhere
+- If an item could be an entry point, generated artifact, plugin hook, or runtime-discovered module, do not flag it unless the evidence is strong
+- Prefer omission over false positives
+- Mention confidence explicitly in explanatory objects when the schema allows it
 
 ## Output Format
 
@@ -56,15 +60,15 @@ Return a single JSON block (fenced with ```json):
 ```json
 {
   "dead_exports": [
-    {"file": "src/utils.ts", "name": "unusedHelper", "type": "function"}
+    {"file": "src/utils.ts", "name": "unusedHelper", "type": "function", "confidence": "high|medium", "why": "Export is never imported outside its declaring file"}
   ],
   "orphaned_files": ["src/old-module.ts"],
   "unused_deps": ["left-pad"],
   "unreachable": [
-    {"file": "src/handler.ts", "line": 42, "description": "Code after unconditional return"}
+    {"file": "src/handler.ts", "line": 42, "description": "Code after unconditional return", "confidence": "high|medium", "why": "Execution exits earlier on every path"}
   ],
   "deprecated": [
-    {"file": "src/api.ts", "line": 10, "pattern": "fs.exists", "replacement": "fs.existsSync or fs.promises.access"}
+    {"file": "src/api.ts", "line": 10, "pattern": "fs.exists", "replacement": "fs.existsSync or fs.promises.access", "confidence": "high|medium", "why": "API is deprecated in current runtime docs"}
   ],
   "summary": {
     "total_issues": 5,
@@ -74,3 +78,8 @@ Return a single JSON block (fenced with ```json):
 ```
 
 If a category was not requested or has no findings, use an empty array.
+
+Rules:
+- Keep `orphaned_files` and `unused_deps` as arrays of strings for compatibility
+- `confidence` must be `high` or `medium`; do not emit low-confidence findings
+- `why` must explain the evidence that makes the finding safe to act on

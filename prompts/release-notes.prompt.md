@@ -21,6 +21,11 @@ You will receive:
 - Do NOT wrap the output in code fences -- output pure markdown directly
 - Include contributor acknowledgments from commit authors and PR authors
 - If a commit message references an issue number (#123), keep the reference
+- Do not invent features, fixes, impact claims, issue numbers, migration steps, or contributor names that are not supported by the provided source material
+- If the source material is insufficient to support a concrete claim, use cautious wording or omit the claim
+- Prefer crisp user-facing outcomes over internal implementation detail
+- Omit empty categories rather than listing placeholders
+- Keep the tone factual and release-ready, not promotional fluff
 
 ## Categories
 

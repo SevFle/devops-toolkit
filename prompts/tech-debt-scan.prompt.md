@@ -50,12 +50,15 @@ You will receive:
 ## Instructions
 
 - Be specific and actionable -- vague findings are not useful
-- Include file paths and line numbers for every item
+- Include repo-relative file paths and line numbers for every item
 - Estimate effort in hours (0.5, 1, 2, 4, 8, 16, 40)
 - Assign priority: P0 (fix now), P1 (fix soon), P2 (plan for), P3 (nice to have)
 - Suggest a concrete fix for each item
 - Respect the max_items_per_category limit
 - Order items within each category by priority (P0 first)
+- Favor debt that causes current delivery pain, reliability risk, or recurring maintenance cost over purely theoretical cleanup
+- Deduplicate overlapping observations across categories; prefer the category with the clearest owner and remediation path
+- Include `confidence` only when the evidence is clear in the provided context
 
 ## Output Format
 
@@ -70,7 +73,10 @@ Return a single JSON block (fenced with ```json):
       "description": "processRequest function is 250 lines with cyclomatic complexity ~30",
       "estimated_effort_hours": 8,
       "priority": "P1",
-      "suggested_fix": "Extract validation, transformation, and persistence into separate functions"
+      "suggested_fix": "Extract validation, transformation, and persistence into separate functions",
+      "confidence": "high|medium",
+      "current_pain": "Changes to request handling require edits across one oversized function",
+      "blast_radius": "Affects onboarding, review speed, and defect risk for all request-path changes"
     }
   ],
   "smells": [],
@@ -82,14 +88,23 @@ Return a single JSON block (fenced with ```json):
       "description": "TODO: implement rate limiting -- no rate limiting exists on auth endpoints",
       "estimated_effort_hours": 4,
       "priority": "P0",
-      "suggested_fix": "Add express-rate-limit middleware to /auth routes with 10 req/min limit"
+      "suggested_fix": "Add express-rate-limit middleware to /auth routes with 10 req/min limit",
+      "confidence": "high|medium",
+      "current_pain": "Authentication endpoints remain exposed to abuse until this TODO is resolved",
+      "blast_radius": "Can affect availability and account security"
     }
   ],
   "deps": [],
   "summary": {
     "total_items": 2,
     "total_effort_hours": 12,
-    "by_priority": {"P0": 1, "P1": 1, "P2": 0, "P3": 0}
+    "by_priority": {"P0": 1, "P1": 1, "P2": 0, "P3": 0},
+    "quick_wins": ["Resolve TODOs with <=2h effort first"]
   }
 }
 ```
+
+Rules:
+- `confidence` must be `high` or `medium`; do not emit low-confidence items
+- `current_pain` should describe the present-day engineering or runtime cost
+- `blast_radius` should summarize who or what is affected if the item is left unresolved
