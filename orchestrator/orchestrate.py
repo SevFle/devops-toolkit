@@ -248,6 +248,7 @@ def _post_implementation_comment(
     duration_seconds: float,
     exit_code: int,
     has_diff: bool,
+    files_changed: int | None,
     is_complete: bool,
     is_stuck: bool,
     remaining_tasks: list[str] | None = None,
@@ -257,31 +258,84 @@ def _post_implementation_comment(
     if not setup.pr_url:
         return
 
+    body = _format_implementation_comment(
+        attempt=attempt,
+        max_attempts=max_attempts,
+        tasks_before=tasks_before,
+        tasks_after=tasks_after,
+        duration_seconds=duration_seconds,
+        exit_code=exit_code,
+        has_diff=has_diff,
+        files_changed=files_changed,
+        is_complete=is_complete,
+        is_stuck=is_stuck,
+        remaining_tasks=remaining_tasks,
+        previous_errors=previous_errors,
+    )
+    comment_on_pr(setup.pr_url, body, setup.work_dir, logger)
+
+
+def _format_implementation_comment(
+    *,
+    attempt: int,
+    max_attempts: int,
+    tasks_before: str,
+    tasks_after: str,
+    duration_seconds: float,
+    exit_code: int,
+    has_diff: bool,
+    files_changed: int | None,
+    is_complete: bool,
+    is_stuck: bool,
+    remaining_tasks: list[str] | None = None,
+    previous_errors: list[str] | None = None,
+) -> str:
+    """Format an implementation comment for PR progress updates."""
     status = "completed" if exit_code == 0 else f"exited with code {exit_code}"
+    checklist_changed = tasks_before != tasks_after
 
     # Determine what happens next
     if is_complete:
-        next_step = ":white_check_mark: All tasks complete — moving to review phase"
+        next_step = ":white_check_mark: All checklist items complete — moving to review phase"
+    elif is_stuck and has_diff:
+        next_step = ":warning: Checklist did not move in consecutive runs, aborting automation"
     elif is_stuck:
-        next_step = ":x: Stuck — no progress in consecutive runs, aborting"
+        next_step = ":x: Checklist did not move in consecutive runs, aborting"
     elif attempt >= max_attempts:
         next_step = ":x: Max attempts reached, aborting"
+    elif has_diff and not checklist_changed:
+        next_step = f":repeat: Code changed but checklist stayed flat — retrying (attempt {attempt + 1}/{max_attempts})"
     else:
         next_step = f":repeat: Retrying (attempt {attempt + 1}/{max_attempts})"
+
+    if has_diff:
+        if files_changed and files_changed > 0:
+            changes_value = f"yes ({files_changed} files)"
+        else:
+            changes_value = "yes"
+    else:
+        changes_value = "no new changes"
 
     lines = [
         f"### Implementation attempt {attempt}/{max_attempts}\n",
         "| Metric | Value |",
         "|--------|-------|",
         f"| Status | {status} |",
-        f"| Tasks | {tasks_before} → {tasks_after} |",
+        f"| OpenSpec checklist | {tasks_before} → {tasks_after} |",
         f"| Duration | {duration_seconds:.0f}s |",
-        f"| Changes | {'yes' if has_diff else 'no new changes'} |",
+        f"| Code changes | {changes_value} |",
         f"| Next | {next_step} |",
     ]
 
+    if has_diff and not checklist_changed:
+        lines.append(
+            "\n> Note: this progress snapshot is driven by the OpenSpec checklist. "
+            "Code changes were detected without checklist movement, so actual implementation "
+            "may be ahead of this snapshot if `tasks.md` was not updated yet."
+        )
+
     if remaining_tasks:
-        lines.append(f"\n**Remaining tasks ({len(remaining_tasks)}):**")
+        lines.append(f"\n**Remaining checklist items ({len(remaining_tasks)}):**")
         for task in remaining_tasks[:10]:
             lines.append(f"- [ ] {task}")
         if len(remaining_tasks) > 10:
@@ -292,7 +346,7 @@ def _post_implementation_comment(
         for err in previous_errors:
             lines.append(f"```\n{err}\n```")
 
-    comment_on_pr(setup.pr_url, "\n".join(lines), setup.work_dir, logger)
+    return "\n".join(lines)
 
 
 def _ensure_pr(
@@ -444,6 +498,7 @@ def implementation_phase(
             duration_seconds=result.duration_seconds,
             exit_code=result.exit_code,
             has_diff=post_progress.has_meaningful_diff,
+            files_changed=post_progress.git_diff.files_changed if post_progress.git_diff else None,
             is_complete=post_progress.is_complete,
             is_stuck=post_progress.is_stuck,
             remaining_tasks=remaining_after if remaining_after else None,

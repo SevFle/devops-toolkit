@@ -284,6 +284,52 @@ class TestExtractRemainingTasks:
         assert remaining == []
 
 
+class TestImplementationCommentFormatting:
+    def test_labels_checklist_progress_and_adds_reality_note(self):
+        from orchestrate import _format_implementation_comment
+
+        body = _format_implementation_comment(
+            attempt=3,
+            max_attempts=6,
+            tasks_before="12/118",
+            tasks_after="12/118",
+            duration_seconds=2400,
+            exit_code=0,
+            has_diff=True,
+            files_changed=14,
+            is_complete=False,
+            is_stuck=False,
+            remaining_tasks=["Write E2E tests", "Implement conflict detection"],
+            previous_errors=None,
+        )
+
+        assert "| OpenSpec checklist | 12/118 → 12/118 |" in body
+        assert "| Code changes | yes (14 files) |" in body
+        assert "Remaining checklist items (2):" in body
+        assert "actual implementation may be ahead of this snapshot" in body
+
+    def test_stuck_message_uses_checklist_specific_language(self):
+        from orchestrate import _format_implementation_comment
+
+        body = _format_implementation_comment(
+            attempt=4,
+            max_attempts=6,
+            tasks_before="12/118",
+            tasks_after="12/118",
+            duration_seconds=2400,
+            exit_code=-1,
+            has_diff=True,
+            files_changed=6,
+            is_complete=False,
+            is_stuck=True,
+            remaining_tasks=None,
+            previous_errors=["Claude timed out"],
+        )
+
+        assert "Checklist did not move in consecutive runs" in body
+        assert "**Recent errors:**" in body
+
+
 class TestReadOpenspecContext:
     def test_reads_proposal_and_specs(self, tmp_path):
         change_dir = tmp_path / "openspec" / "changes" / "my-feature"
