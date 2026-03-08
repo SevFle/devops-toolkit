@@ -33,10 +33,6 @@ on:
       PAT_TOKEN:
         required: true
 
-concurrency:
-  group: openspec-orchestrate-${{ inputs.change_name }}-${{ github.run_id }}
-  cancel-in-progress: false
-
 jobs:
   orchestrate:
     runs-on: ${{ fromJSON(format('["{0}"]', inputs.runners)) }}
