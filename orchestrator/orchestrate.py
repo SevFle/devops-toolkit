@@ -220,7 +220,7 @@ def setup_phase(
     complexity = score_complexity(args.change_name, work_dir)
     logger.info(
         "Complexity scored",
-        level=complexity.level,
+        complexity_level=complexity.level,
         raw_score=complexity.raw_score,
         task_count=complexity.task_count,
         keyword_score=complexity.keyword_score,
@@ -743,7 +743,7 @@ def main() -> int:
             )
             logger.info(
                 "Adaptive budget applied",
-                level=complexity.level,
+                complexity_level=complexity.level,
                 max_attempts=config.max_implementation_attempts,
                 timeout=config.claude_timeout,
                 budget=config.time_budget_seconds,
