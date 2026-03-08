@@ -20,7 +20,7 @@ on:
         default: 'self-hosted'
 
 concurrency:
-  group: openspec-interview-${{ github.event.issue.number || github.event.comment.issue_url || github.event.inputs.issue_number }}
+  group: openspec-interview-${{ github.event.issue.number || github.event.inputs.issue_number || github.run_id }}
   cancel-in-progress: true
 
 jobs:

@@ -70,6 +70,10 @@ on:
         # (e.g. '["self-hosted", "linux"]'). Invalid JSON will cause a runtime error.
         description: 'Runner label(s), JSON array or string'
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   install:
     name: Install Dependencies
