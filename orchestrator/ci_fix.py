@@ -184,10 +184,9 @@ def run_claude_fix(
 ) -> FixResult:
     """Run Claude with the fix prompt."""
     cmd = [
-        "claude", "-p", prompt,
-        "--model", "claude-sonnet-4-5-20250514",
-        "--max-turns", "30",
-        "--output-format", "text",
+        "opencode", "run",
+        "--model", "zai-coding-plan/glm-5",
+        prompt,
     ]
 
     logger.info("Starting Claude CI fix", prompt_length=len(prompt))

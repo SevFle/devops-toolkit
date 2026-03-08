@@ -5,11 +5,11 @@ on:
     inputs:
       ai_cli:
         type: string
-        default: 'claude'
+        default: 'opencode'
         description: 'AI CLI to use: claude or opencode'
       ai_model:
         type: string
-        default: 'claude-sonnet-4-5-20250514'
+        default: 'zai-coding-plan/glm-5'
         description: 'AI model for analysis'
       categories:
         type: string
@@ -83,10 +83,13 @@ jobs:
           # Sample of largest source files (for complexity analysis)
           echo "" >> "$CONTEXT_FILE"
           echo "## Largest Source Files (first 200 lines each)" >> "$CONTEXT_FILE"
+          # Use temp file to avoid broken pipe (SIGPIPE) with set -euo pipefail
+          LARGEST_FILES=$(mktemp)
           find . -type f \( -name "*.ts" -o -name "*.js" -o -name "*.py" -o -name "*.go" \) \
             -not -path './.git/*' -not -path './node_modules/*' -not -path './vendor/*' \
             -not -path './dist/*' -not -path './build/*' \
-            -exec wc -l {} + 2>/dev/null | sort -rn | head -11 | tail -10 | awk '{print $2}' | while read -r file; do
+            -exec wc -l {} + 2>/dev/null | sort -rn > "$LARGEST_FILES" || true
+          head -11 "$LARGEST_FILES" | tail -10 | awk '{print $2}' | while read -r file; do
             if [ -f "$file" ]; then
               echo "" >> "$CONTEXT_FILE"
               echo "### $file" >> "$CONTEXT_FILE"
@@ -95,6 +98,7 @@ jobs:
               echo '```' >> "$CONTEXT_FILE"
             fi
           done
+          rm -f "$LARGEST_FILES"
 
           echo "context_file=$CONTEXT_FILE" >> "$GITHUB_OUTPUT"
 
@@ -131,15 +135,13 @@ jobs:
 
           RESPONSE_FILE=$(mktemp /tmp/tech-debt-response-XXXXXX.txt)
 
-          run_ai() {
-            if [ "$AI_CLI" = "opencode" ]; then
-              opencode -p --model "$AI_MODEL" --max-turns 1 --output-format text
-            else
-              claude -p --model "$AI_MODEL" --max-turns 1 --allowedTools "" --output-format text
-            fi
-          }
+          PROMPT_FILE="${{ steps.prompt.outputs.prompt_file }}"
 
-          cat "${{ steps.prompt.outputs.prompt_file }}" | run_ai > "$RESPONSE_FILE" 2>&1 || true
+          if [ "$AI_CLI" = "opencode" ]; then
+            cat "$PROMPT_FILE" | opencode run --model "$AI_MODEL" > "$RESPONSE_FILE" 2>&1 || true
+          else
+            cat "$PROMPT_FILE" | claude -p --model "$AI_MODEL" --max-turns 1 --allowedTools "" --output-format text > "$RESPONSE_FILE" 2>&1 || true
+          fi
 
           echo "response_file=$RESPONSE_FILE" >> "$GITHUB_OUTPUT"
 

@@ -131,11 +131,8 @@ jobs:
           echo '```' >> "$PROMPT_FILE"
 
           RESPONSE_FILE=$(mktemp /tmp/release-notes-response-XXXXXX.txt)
-          cat "$PROMPT_FILE" | claude -p \
-            --model "claude-sonnet-4-5-20250514" \
-            --max-turns 1 \
-            --allowedTools "" \
-            --output-format text > "$RESPONSE_FILE" 2>&1 || true
+          cat "$PROMPT_FILE" | opencode run \
+            --model "zai-coding-plan/glm-5" > "$RESPONSE_FILE" 2>&1 || true
 
           NOTES_FILE=$(mktemp /tmp/release-notes-final-XXXXXX.md)
           sed '/^```markdown$/d; /^```$/d' "$RESPONSE_FILE" > "$NOTES_FILE"

@@ -5,11 +5,11 @@ on:
     inputs:
       ai_cli:
         type: string
-        default: 'claude'
+        default: 'opencode'
         description: 'AI CLI to use: claude or opencode'
       ai_model:
         type: string
-        default: 'claude-sonnet-4-5-20250514'
+        default: 'zai-coding-plan/glm-5'
         description: 'AI model for review'
       severity_threshold:
         type: string
@@ -108,15 +108,11 @@ jobs:
           set -euo pipefail
           RESPONSE_FILE=$(mktemp)
 
-          run_ai() {
-            if [ "$AI_CLI" = "opencode" ]; then
-              opencode -p --model "$AI_MODEL" --max-turns 1 --output-format text
-            else
-              claude -p --model "$AI_MODEL" --max-turns 1 --allowedTools "" --output-format text
-            fi
-          }
-
-          cat /tmp/review-prompt.md | run_ai > "$RESPONSE_FILE" 2>&1 || true
+          if [ "$AI_CLI" = "opencode" ]; then
+            cat /tmp/review-prompt.md | opencode run --model "$AI_MODEL" > "$RESPONSE_FILE" 2>&1 || true
+          else
+            cat /tmp/review-prompt.md | claude -p --model "$AI_MODEL" --max-turns 1 --allowedTools "" --output-format text > "$RESPONSE_FILE" 2>&1 || true
+          fi
 
           # Extract JSON block
           JSON_FILE=$(mktemp)

@@ -11,7 +11,7 @@ inputs:
   model:
     description: 'Claude model to use'
     required: false
-    default: 'claude-sonnet-4-5-20250514'
+    default: 'zai-coding-plan/glm-5'
   max_turns:
     description: 'Maximum conversation turns'
     required: false

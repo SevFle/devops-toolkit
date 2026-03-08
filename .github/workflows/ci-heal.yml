@@ -13,8 +13,8 @@ on:
         description: 'Max heal attempts per branch'
       ai_model:
         type: string
-        default: 'claude-sonnet-4-5-20250514'
-        description: 'Claude model for fixes'
+        default: 'zai-coding-plan/glm-5'
+        description: 'AI model for fixes'
       timeout_minutes:
         type: number
         default: 30

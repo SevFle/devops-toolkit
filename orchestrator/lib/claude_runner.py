@@ -30,7 +30,7 @@ class ClaudeRunner:
         config: Config,
         work_dir: Path,
         logger: StructuredLogger,
-        model: str = "claude-sonnet-4-5-20250514",
+        model: str = "zai-coding-plan/glm-5",
     ) -> None:
         self._config = config
         self._work_dir = work_dir
@@ -109,10 +109,9 @@ class ClaudeRunner:
     def _execute(self, prompt: str) -> ClaudeResult:
         """Execute Claude CLI in non-interactive mode."""
         cmd = [
-            "claude", "-p", prompt,
+            "opencode", "run",
             "--model", self._model,
-            "--max-turns", "30",
-            "--output-format", "text",
+            prompt,
         ]
 
         self._log.info("Starting Claude", prompt_preview=prompt[:200])

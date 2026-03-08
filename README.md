@@ -64,7 +64,7 @@ AI-driven feature implementation from issue to PR:
 
 ### AI-Powered Analysis
 
-All AI workflows invoke an AI CLI with specialized prompts and parse structured JSON output. By default they use Claude CLI (`claude -p`), but can be switched to OpenCode (`opencode -p`) via the `ai_cli` input on any workflow.
+All AI workflows invoke an AI CLI with specialized prompts and parse structured JSON output. By default they use OpenCode (`opencode run`), but can be switched to Claude CLI (`claude -p`) via the `ai_cli` input on any workflow.
 
 | Workflow | Description | Trigger |
 |----------|-------------|---------|
@@ -89,7 +89,7 @@ Wraps `claude -p` with structured output parsing for OpenSpec markers (`OPENSPEC
 - uses: SevFle/devops-toolkit/actions/claude-run@main
   with:
     prompt: 'Review this code for security issues'
-    model: 'claude-sonnet-4-5-20250514'
+    model: 'zai-coding-plan/glm-5'
 ```
 
 ### `actions/docker-build`
