@@ -1,8 +1,9 @@
 name: PR Quality
 on:
   pull_request:
-    types: [opened, synchronize, edited]
+    types: [opened, synchronize, edited, reopened, ready_for_review]
 jobs:
   quality:
+    if: ${{ !github.event.pull_request.draft }}
     uses: SevFle/devops-toolkit/.github/workflows/pr-quality.yml@main
     secrets: inherit

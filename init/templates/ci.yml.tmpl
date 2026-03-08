@@ -1,6 +1,7 @@
 name: CI
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [{{BASE_BRANCH}}]
 concurrency:
@@ -8,6 +9,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   ci:
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     uses: SevFle/devops-toolkit/.github/workflows/ci.yml@main
     with:
       docker_build: {{DOCKER_BUILD}}
