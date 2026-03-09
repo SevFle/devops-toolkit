@@ -281,6 +281,21 @@ class TestTemplateContracts:
 		assert "format('{0}-beta', '{{APP_NAME}}')" in content
 		assert "format('{0}-prod', '{{APP_NAME}}')" in content
 
+	def test_openspec_orchestrate_uses_openspec_lifecycle_commands(self):
+		content = (WORKFLOWS_DIR / "openspec-orchestrate.yml").read_text(encoding="utf-8")
+
+		assert "openspec status --change \"$CHANGE_NAME\" --json" in content
+		assert "openspec instructions apply --change \"$CHANGE_NAME\" --json" in content
+		assert "OpenSpec completion check" in content
+
+	def test_openspec_orchestrate_supports_optional_auto_archive(self):
+		workflow_content = (WORKFLOWS_DIR / "openspec-orchestrate.yml").read_text(encoding="utf-8")
+		template_content = (TEMPLATES_DIR / "openspec-orchestrate.yml.tmpl").read_text(encoding="utf-8")
+
+		assert "auto_archive_on_success" in workflow_content
+		assert "openspec archive \"$CHANGE_NAME\"" in workflow_content
+		assert "auto_archive_on_success" in template_content
+
 
 class TestInitScaffolding:
 	ANSWERS = "y\nn\ny\ny\nn\nn\nn\nn\nn\nn\nn\nn\nn\nn\nn\n"

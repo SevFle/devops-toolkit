@@ -5,10 +5,16 @@ on:
       change_name:
         description: 'OpenSpec change name'
         required: true
+      auto_archive_on_success:
+        description: 'Archive completed change automatically'
+        required: false
+        type: boolean
+        default: false
 jobs:
   orchestrate:
     uses: SevFle/devops-toolkit/.github/workflows/openspec-orchestrate.yml@main
     with:
       change_name: ${{ inputs.change_name }}
+      auto_archive_on_success: ${{ inputs.auto_archive_on_success }}
       base_branch: {{BASE_BRANCH}}
     secrets: inherit

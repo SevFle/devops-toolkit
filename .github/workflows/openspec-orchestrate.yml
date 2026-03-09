@@ -19,6 +19,10 @@ on:
         type: boolean
         default: false
         description: 'Skip Claude code review phase'
+      auto_archive_on_success:
+        type: boolean
+        default: false
+        description: 'Archive the change with openspec archive after successful completion'
       base_branch:
         type: string
         default: 'develop'
@@ -57,13 +61,50 @@ jobs:
           git config --global user.email "devops-toolkit[bot]@users.noreply.github.com"
 
       - name: Validate tools
+        env:
+          SKIP_REVIEW: ${{ inputs.skip_review }}
         run: |
           echo "Checking required tools..."
           command -v python3 || { echo "ERROR: python3 not found"; exit 1; }
-          command -v claude || { echo "ERROR: claude not found"; exit 1; }
+          command -v opencode || { echo "ERROR: opencode not found"; exit 1; }
+          command -v openspec || { echo "ERROR: openspec not found"; exit 1; }
+          if [ "$SKIP_REVIEW" != "true" ]; then
+            command -v claude || { echo "ERROR: claude not found (required when skip_review=false)"; exit 1; }
+          fi
           command -v gh || { echo "ERROR: gh not found"; exit 1; }
           command -v git || { echo "ERROR: git not found"; exit 1; }
           echo "All tools available."
+
+      - name: OpenSpec preflight (status + apply)
+        env:
+          CHANGE_NAME: ${{ inputs.change_name }}
+        run: |
+          set -euo pipefail
+          openspec status --change "$CHANGE_NAME" --json > /tmp/openspec-status-before.json
+          openspec instructions apply --change "$CHANGE_NAME" --json > /tmp/openspec-apply-before.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          status_path = Path('/tmp/openspec-status-before.json')
+          apply_path = Path('/tmp/openspec-apply-before.json')
+          status = json.loads(status_path.read_text(encoding='utf-8'))
+          apply_data = json.loads(apply_path.read_text(encoding='utf-8'))
+
+          schema = status.get('schemaName') or apply_data.get('schemaName') or 'unknown'
+          progress = apply_data.get('progress', {})
+          complete = progress.get('complete', 0)
+          total = progress.get('total', 0)
+          state = apply_data.get('state', 'unknown')
+
+          print(f'OpenSpec schema={schema}')
+          print(f'OpenSpec state={state}')
+          print(f'OpenSpec progress={complete}/{total}')
+
+          if state == 'blocked':
+            raise SystemExit('OpenSpec apply state is blocked. Resolve missing artifacts before orchestration.')
+          PY
 
       - name: Run orchestrator
         env:
@@ -85,13 +126,67 @@ jobs:
             --base-branch "${{ inputs.base_branch }}" \
             $SKIP_FLAG
 
+      - name: OpenSpec completion check
+        if: always()
+        id: openspec-check
+        env:
+          CHANGE_NAME: ${{ inputs.change_name }}
+        run: |
+          set -euo pipefail
+          openspec status --change "$CHANGE_NAME" --json > /tmp/openspec-status-after.json
+          openspec instructions apply --change "$CHANGE_NAME" --json > /tmp/openspec-apply-after.json
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          apply_data = json.loads(Path('/tmp/openspec-apply-after.json').read_text(encoding='utf-8'))
+          status_data = json.loads(Path('/tmp/openspec-status-after.json').read_text(encoding='utf-8'))
+
+          progress = apply_data.get('progress', {})
+          complete = progress.get('complete', 0)
+          total = progress.get('total', 0)
+          state = apply_data.get('state', 'unknown')
+          schema = status_data.get('schemaName') or apply_data.get('schemaName') or 'unknown'
+          is_complete = state == 'all_done' or (total > 0 and complete == total)
+
+          with open('/tmp/openspec-check.out', 'w', encoding='utf-8') as fh:
+            fh.write(f'schema={schema}\n')
+            fh.write(f'state={state}\n')
+            fh.write(f'complete={complete}\n')
+            fh.write(f'total={total}\n')
+            fh.write(f'is_complete={str(is_complete).lower()}\n')
+          PY
+
+          cat /tmp/openspec-check.out >> "$GITHUB_OUTPUT"
+
+      - name: Archive completed change
+        if: success() && inputs.auto_archive_on_success && steps.openspec-check.outputs.is_complete == 'true'
+        env:
+          CHANGE_NAME: ${{ inputs.change_name }}
+        run: |
+          set -euo pipefail
+          openspec archive "$CHANGE_NAME"
+
       - name: Write job summary
         if: always()
         env:
           CHANGE_NAME: ${{ inputs.change_name }}
           JOB_STATUS: ${{ job.status }}
+          OPENSPEC_SCHEMA: ${{ steps.openspec-check.outputs.schema }}
+          OPENSPEC_STATE: ${{ steps.openspec-check.outputs.state }}
+          OPENSPEC_COMPLETE: ${{ steps.openspec-check.outputs.complete }}
+          OPENSPEC_TOTAL: ${{ steps.openspec-check.outputs.total }}
+          OPENSPEC_IS_COMPLETE: ${{ steps.openspec-check.outputs.is_complete }}
         run: |
           echo "## Orchestration Result" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Change:** $CHANGE_NAME" >> "$GITHUB_STEP_SUMMARY"
           echo "**Status:** $JOB_STATUS" >> "$GITHUB_STEP_SUMMARY"
+          echo "**OpenSpec schema:** ${OPENSPEC_SCHEMA:-unknown}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**OpenSpec state:** ${OPENSPEC_STATE:-unknown}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**OpenSpec progress:** ${OPENSPEC_COMPLETE:-0}/${OPENSPEC_TOTAL:-0}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**OpenSpec complete:** ${OPENSPEC_IS_COMPLETE:-false}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.auto_archive_on_success }}" = "true" ]; then
+            echo "**Auto-archive requested:** true" >> "$GITHUB_STEP_SUMMARY"
+          fi
