@@ -265,9 +265,9 @@ class ProgressDetector:
         elif tasks_increased:
             made_progress = True
         elif has_meaningful:
-            # Files changed but no new tasks completed — count as partial
-            # (allows 1 grace attempt but not infinite)
-            made_progress = False
+            # Files changed but no new tasks completed yet — don't mark the run
+            # as stuck solely because the checklist lags behind the code changes.
+            made_progress = True
         else:
             made_progress = False
 

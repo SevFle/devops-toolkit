@@ -278,6 +278,58 @@ class TestAssessProgress:
     @patch.object(ProgressDetector, "check_openspec_cli")
     @patch.object(ProgressDetector, "check_tasks_md")
     @patch.object(ProgressDetector, "check_git_diff")
+    def test_meaningful_diff_does_not_increment_stuck_counter(
+        self, mock_diff, mock_tasks, mock_openspec, tmp_work_dir, logger,
+    ):
+        mock_openspec.return_value = OpenSpecProgress(
+            state="ready", completed=1, total=5, remaining=4,
+        )
+        mock_tasks.return_value = TasksMdProgress(completed=1, total=5)
+        mock_diff.return_value = GitDiffResult(
+            has_changes=True, has_meaningful_changes=True, files_changed=3,
+        )
+
+        detector = ProgressDetector("test-change", tmp_work_dir, logger, max_consecutive_no_progress=2)
+
+        first = detector.assess_progress()
+        second = detector.assess_progress()
+        third = detector.assess_progress()
+
+        assert first.is_stuck is False
+        assert second.is_stuck is False
+        assert third.is_stuck is False
+        assert detector.consecutive_no_progress == 0
+
+    @patch.object(ProgressDetector, "check_openspec_cli")
+    @patch.object(ProgressDetector, "check_tasks_md")
+    @patch.object(ProgressDetector, "check_git_diff")
+    def test_stuck_requires_flat_checklist_and_no_meaningful_diff(
+        self, mock_diff, mock_tasks, mock_openspec, tmp_work_dir, logger,
+    ):
+        mock_openspec.return_value = OpenSpecProgress(
+            state="ready", completed=1, total=5, remaining=4,
+        )
+        mock_tasks.return_value = TasksMdProgress(completed=1, total=5)
+        mock_diff.side_effect = [
+            GitDiffResult(has_changes=False, has_meaningful_changes=False, files_changed=0),
+            GitDiffResult(has_changes=False, has_meaningful_changes=False, files_changed=0),
+            GitDiffResult(has_changes=False, has_meaningful_changes=False, files_changed=0),
+        ]
+
+        detector = ProgressDetector("test-change", tmp_work_dir, logger, max_consecutive_no_progress=2)
+
+        first = detector.assess_progress()
+        second = detector.assess_progress()
+        third = detector.assess_progress()
+
+        assert first.is_stuck is False
+        assert second.is_stuck is False
+        assert third.is_stuck is True
+        assert detector.consecutive_no_progress == 2
+
+    @patch.object(ProgressDetector, "check_openspec_cli")
+    @patch.object(ProgressDetector, "check_tasks_md")
+    @patch.object(ProgressDetector, "check_git_diff")
     def test_openspec_authoritative_over_tasks_md(
         self, mock_diff, mock_tasks, mock_openspec, tmp_work_dir, logger,
     ):

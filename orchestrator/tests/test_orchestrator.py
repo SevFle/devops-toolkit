@@ -163,10 +163,18 @@ class TestToolValidation:
         from orchestrate import validate_tools
 
         logger = StructuredLogger("test")
-        # With skip_review=True, claude is still in REQUIRED_TOOLS
-        # so it will still be missing
         missing = validate_tools(skip_review=True, logger=logger)
-        assert "claude" in missing
+        assert "claude" not in missing
+
+    @patch("orchestrate._check_tool")
+    def test_validate_tools_requires_opencode_for_implementation(self, mock_check):
+        mock_check.side_effect = lambda name: name != "opencode"
+
+        from orchestrate import validate_tools
+
+        logger = StructuredLogger("test")
+        missing = validate_tools(skip_review=True, logger=logger)
+        assert "opencode" in missing
 
 
 class TestMainExceptionHandlers:
@@ -352,3 +360,59 @@ class TestReadOpenspecContext:
 
         ctx = read_openspec_context("nonexistent", tmp_path)
         assert "no openspec context found" in ctx
+
+
+class TestClaudeRunnerPrompts:
+    def _make_runner(self, tmp_path):
+        from lib.claude_runner import ClaudeRunner
+
+        return ClaudeRunner(Config(), tmp_path, StructuredLogger("test"))
+
+    def test_run_prompt_requires_immediate_task_updates(self, tmp_path):
+        change_dir = tmp_path / "openspec" / "changes" / "demo-change"
+        change_dir.mkdir(parents=True)
+        (change_dir / "tasks.md").write_text("- [ ] Ship feature\n")
+
+        runner = self._make_runner(tmp_path)
+
+        prompt = runner._build_run_prompt("demo-change", "- [ ] Ship feature\n")
+
+        assert "Do not batch checkbox updates at the end of the run." in prompt
+        assert "immediately change its checkbox" in prompt
+        assert "openspec/changes/demo-change/tasks.md" in prompt
+
+    def test_retry_prompt_syncs_checklist_before_new_work(self, tmp_path):
+        change_dir = tmp_path / "openspec" / "changes" / "demo-change"
+        change_dir.mkdir(parents=True)
+        (change_dir / "tasks.md").write_text("- [ ] Ship feature\n")
+
+        runner = self._make_runner(tmp_path)
+
+        prompt = runner._build_retry_prompt(
+            "demo-change",
+            "- [ ] Ship feature\n",
+            ["Ship feature"],
+            ["lint failed"],
+        )
+
+        assert "First, sync the checklist with the current repository state" in prompt
+        assert "Do not mark partial work as complete." in prompt
+        assert "Previous errors to avoid:" in prompt
+
+    def test_fix_prompt_keeps_checklist_accurate(self, tmp_path):
+        change_dir = tmp_path / "openspec" / "changes" / "demo-change"
+        change_dir.mkdir(parents=True)
+        (change_dir / "tasks.md").write_text("- [ ] Ship feature\n")
+
+        runner = self._make_runner(tmp_path)
+
+        with patch.object(runner, "_execute") as mock_execute:
+            mock_execute.return_value = MagicMock()
+            runner.run_with_fixes(
+                "demo-change",
+                [{"severity": "high", "message": "Fix bug", "suggestion": "Add guard"}],
+            )
+
+        prompt = mock_execute.call_args.args[0]
+        assert "Keep the OpenSpec checklist accurate while applying fixes" in prompt
+        assert "Do not batch checkbox updates at the end of the run." in prompt

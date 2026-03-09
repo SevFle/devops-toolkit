@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
 # Tool validation
 # ---------------------------------------------------------------------------
 
-REQUIRED_TOOLS = ["git", "claude"]
+REQUIRED_TOOLS = ["git", "opencode"]
 REVIEW_TOOLS = ["claude"]
 PR_TOOLS = ["gh"]
 

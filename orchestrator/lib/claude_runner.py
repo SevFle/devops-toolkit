@@ -37,37 +37,52 @@ class ClaudeRunner:
         self._log = logger
         self._model = model
 
-    def run(self, change_name: str) -> ClaudeResult:
-        """Run Claude with instructions to implement the given change.
+    def _tasks_file_path(self, change_name: str) -> Path:
+        """Return the canonical tasks.md path for a change."""
+        return self._work_dir / "openspec" / "changes" / change_name / "tasks.md"
 
-        Reads the openspec tasks file and asks Claude to implement remaining tasks.
-        """
-        tasks_file = self._work_dir / "openspec" / "changes" / change_name / "tasks.md"
-        if tasks_file.exists():
-            tasks_content = tasks_file.read_text()
-            prompt = (
-                f"Implement the OpenSpec change '{change_name}'. "
-                f"Here are the tasks from tasks.md:\n\n{tasks_content}\n\n"
-                "Complete all incomplete tasks (marked with '- [ ]'). "
-                "Check off each task as you complete it."
-            )
+    def _checklist_sync_instructions(self, change_name: str) -> str:
+        """Return strict checklist-sync instructions for the implementation agent."""
+        tasks_path = self._tasks_file_path(change_name)
+        relative_path = tasks_path.relative_to(self._work_dir)
+        return (
+            "Checklist sync is mandatory.\n"
+            f"- Keep `{relative_path}` synchronized with the real code state during this run.\n"
+            "- As soon as you fully complete a task, immediately change its checkbox from `- [ ]` to `- [x]` before moving to the next task.\n"
+            "- Do not batch checkbox updates at the end of the run.\n"
+            "- Do not mark partial work as complete.\n"
+            "- Before finishing, re-open the tasks file and verify every completed task is checked off and every incomplete task is still unchecked."
+        )
+
+    def _build_run_prompt(self, change_name: str, tasks_content: str | None) -> str:
+        """Build the initial implementation prompt."""
+        parts = [f"Implement the OpenSpec change '{change_name}'."]
+
+        if tasks_content:
+            parts.append(f"Here are the tasks from tasks.md:\n\n{tasks_content}")
+            parts.append("Complete all incomplete tasks (marked with '- [ ]').")
         else:
-            prompt = f"Implement the OpenSpec change '{change_name}'. Complete all tasks."
-        return self._execute(prompt)
+            parts.append("Complete all tasks.")
 
-    def run_with_context(
+        parts.append(self._checklist_sync_instructions(change_name))
+        return "\n\n".join(parts)
+
+    def _build_retry_prompt(
         self,
         change_name: str,
+        tasks_content: str | None,
         remaining_tasks: list[str],
-        previous_errors: list[str] | None = None,
-    ) -> ClaudeResult:
-        """Run Claude with additional context about remaining work."""
-        tasks_file = self._work_dir / "openspec" / "changes" / change_name / "tasks.md"
+        previous_errors: list[str] | None,
+    ) -> str:
+        """Build a retry prompt with explicit checklist resynchronization."""
         parts = [f"Continue implementing the OpenSpec change '{change_name}'."]
 
-        if tasks_file.exists():
-            tasks_content = tasks_file.read_text()
+        if tasks_content:
             parts.append(f"Here are the tasks from tasks.md:\n\n{tasks_content}")
+
+        parts.append(
+            "First, sync the checklist with the current repository state: if code already completes a task, check it off in tasks.md before starting new work."
+        )
 
         if remaining_tasks:
             tasks_str = "\n".join(f"  - {t}" for t in remaining_tasks[:10])
@@ -77,8 +92,35 @@ class ClaudeRunner:
             errors_str = "\n".join(f"  - {e}" for e in previous_errors[:5])
             parts.append(f"Previous errors to avoid:\n{errors_str}")
 
+        parts.append(self._checklist_sync_instructions(change_name))
         parts.append("Complete as many remaining tasks as possible.")
-        prompt = "\n\n".join(parts)
+        return "\n\n".join(parts)
+
+    def run(self, change_name: str) -> ClaudeResult:
+        """Run Claude with instructions to implement the given change.
+
+        Reads the openspec tasks file and asks Claude to implement remaining tasks.
+        """
+        tasks_file = self._tasks_file_path(change_name)
+        tasks_content = tasks_file.read_text() if tasks_file.exists() else None
+        prompt = self._build_run_prompt(change_name, tasks_content)
+        return self._execute(prompt)
+
+    def run_with_context(
+        self,
+        change_name: str,
+        remaining_tasks: list[str],
+        previous_errors: list[str] | None = None,
+    ) -> ClaudeResult:
+        """Run Claude with additional context about remaining work."""
+        tasks_file = self._tasks_file_path(change_name)
+        tasks_content = tasks_file.read_text() if tasks_file.exists() else None
+        prompt = self._build_retry_prompt(
+            change_name,
+            tasks_content,
+            remaining_tasks,
+            previous_errors,
+        )
         return self._execute(prompt)
 
     def run_with_fixes(
@@ -102,6 +144,10 @@ class ClaudeRunner:
                 entry += f"\n   Suggestion: {suggestion}"
             parts.append(entry)
 
+        parts.append(
+            "Keep the OpenSpec checklist accurate while applying fixes: if a fix completes work for an unchecked task, update tasks.md immediately; do not batch checkbox updates."
+        )
+        parts.append(self._checklist_sync_instructions(change_name))
         parts.append("\nFix all issues listed above. Keep changes minimal and focused.")
         prompt = "\n\n".join(parts)
         return self._execute(prompt)
