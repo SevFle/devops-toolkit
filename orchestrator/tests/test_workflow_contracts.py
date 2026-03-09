@@ -233,6 +233,28 @@ class TestTemplateContracts:
 		assert "needs.sbom.result" in content
 		assert "SBOM generation failed" in content
 
+	def test_reusable_workflows_do_not_reference_secrets_in_if_expressions(self):
+		workflow_names = [
+			"deploy-k8s.yml",
+			"deploy-production.yml",
+			"deploy-staging.yml",
+			"security.yml",
+		]
+
+		violations = []
+		for name in workflow_names:
+			content = (WORKFLOWS_DIR / name).read_text(encoding="utf-8")
+			if "if: always() && secrets.NOTIFY_WEBHOOK_URL != ''" in content:
+				violations.append(name)
+
+		assert violations == []
+
+	def test_self_test_yaml_lint_uses_inline_python_validation(self):
+		content = (WORKFLOWS_DIR / "_self-test.yml").read_text(encoding="utf-8")
+
+		assert 'python3 -c "import pathlib, sys, yaml;' in content
+		assert 'python3 - "$f" <<\'PY\'' not in content
+
 	def test_codeql_auto_detection_is_not_hardcoded(self):
 		content = (WORKFLOWS_DIR / "codeql.yml").read_text(encoding="utf-8")
 

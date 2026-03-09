@@ -240,7 +240,7 @@ jobs:
           echo "All security checks passed!"
 
       - name: Notify webhook
-        if: always() && secrets.NOTIFY_WEBHOOK_URL != ''
+        if: always() && env.WEBHOOK_URL != ''
         env:
           WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
         run: |

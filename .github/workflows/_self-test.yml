@@ -27,13 +27,10 @@ jobs:
           FAILED=0
           for f in .github/workflows/*.yml actions/*/action.yml; do
             echo "Checking $f..."
-            python3 - "$f" <<'PY' || { echo "::error::Invalid YAML: $f"; FAILED=1; }
-            import sys
-            import yaml
-
-            with open(sys.argv[1], 'r', encoding='utf-8') as fh:
-                yaml.safe_load(fh)
-            PY
+            if ! python3 -c "import pathlib, sys, yaml; yaml.safe_load(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))" "$f"; then
+              echo "::error::Invalid YAML: $f"
+              FAILED=1
+            fi
           done
           [ "$FAILED" -eq 0 ] && echo "All YAML files are valid"
           exit "$FAILED"

@@ -326,7 +326,7 @@ jobs:
           echo "- **Strategy:** ${{ inputs.deployment_strategy }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notify webhook
-        if: always() && secrets.NOTIFY_WEBHOOK_URL != ''
+        if: always() && env.WEBHOOK_URL != ''
         env:
           WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
         run: |
