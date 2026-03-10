@@ -39,6 +39,9 @@ on:
         type: string
         default: 'self-hosted'
         description: 'Runner label(s), JSON array or string'
+    secrets:
+      PAT_TOKEN:
+        required: true
 
 jobs:
   quality-gate:
@@ -55,7 +58,7 @@ jobs:
       - name: Run quality checks
         id: checks
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body || '' }}
@@ -158,14 +161,14 @@ jobs:
           if [ -n "$SECURITY_CHECKLIST_PATHS" ]; then
             CHANGED_FILES=$(gh pr diff "$PR_NUMBER" --name-only)
             if CHANGED_FILES="$CHANGED_FILES" python3 - <<'PY'
-            from fnmatch import fnmatch
-            import os
+          from fnmatch import fnmatch
+          import os
 
-            files = [line.strip() for line in os.environ.get('CHANGED_FILES', '').splitlines() if line.strip()]
-            patterns = [item.strip() for item in os.environ.get('SECURITY_CHECKLIST_PATHS', '').split(',') if item.strip()]
-            needs_checklist = any(any(fnmatch(path, pattern) for pattern in patterns) for path in files)
-            raise SystemExit(0 if needs_checklist else 1)
-            PY
+          files = [line.strip() for line in os.environ.get('CHANGED_FILES', '').splitlines() if line.strip()]
+          patterns = [item.strip() for item in os.environ.get('SECURITY_CHECKLIST_PATHS', '').split(',') if item.strip()]
+          needs_checklist = any(any(fnmatch(path, pattern) for pattern in patterns) for path in files)
+          raise SystemExit(0 if needs_checklist else 1)
+          PY
             then
               if printf '%s' "$PR_BODY" | grep -Fqi -- '- [x] security reviewed'; then
                 COMMENT="$COMMENT\n| Risky Change Checklist | PASS | Security checklist acknowledged in PR body |"
