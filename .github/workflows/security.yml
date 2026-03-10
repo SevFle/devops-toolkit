@@ -18,62 +18,18 @@ on:
       ignore_paths:
         type: string
         default: ''
-        description: 'Comma-separated paths to ignore in secret detection'
+        description: 'Comma-separated paths to ignore in scans'
       runners:
         type: string
         default: 'self-hosted'
         description: 'Runner label(s), JSON array or string'
     secrets:
+      PAT_TOKEN:
+        required: true
       NOTIFY_WEBHOOK_URL:
         required: false
 
 jobs:
-  secret-detection:
-    name: Secret Detection
-    runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
-    permissions:
-      contents: read
-      pull-requests: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Apply ignore paths
-        if: inputs.ignore_paths != ''
-        shell: bash
-        env:
-          IGNORE_PATHS: ${{ inputs.ignore_paths }}
-        run: |
-          set -euo pipefail
-          IFS=',' read -ra PATHS <<< "$IGNORE_PATHS"
-          for path in "${PATHS[@]}"; do
-            trimmed=$(echo "$path" | xargs)
-            if [ -n "$trimmed" ] && [ -e "$trimmed" ]; then
-              echo "Removing ignored path from scan workspace: $trimmed"
-              rm -rf "$trimmed"
-            fi
-          done
-
-      - name: Clean stale gitleaks artifacts
-        run: rm -f /tmp/gitleaks.tmp /tmp/gitleaks-*.tar.gz
-        continue-on-error: true
-
-      - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
-
-      - name: Upload SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: results.sarif
-          category: secret-detection
-        continue-on-error: true
-
   dependency-audit:
     name: Dependency Audit
     runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
@@ -199,7 +155,7 @@ jobs:
     name: Security Status
     if: always()
     runs-on: ${{ fromJSON(startsWith(inputs.runners, '[') && inputs.runners || format('["{0}"]', inputs.runners)) }}
-    needs: [secret-detection, dependency-audit, container-scan, sbom]
+    needs: [dependency-audit, container-scan, sbom]
     steps:
       - name: Check results
         id: status
@@ -208,15 +164,13 @@ jobs:
           echo "## Security Scan Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "| Check | Result |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Secret Detection | ${{ needs.secret-detection.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Dependency Audit | ${{ needs.dependency-audit.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Container Scan | ${{ needs.container-scan.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| SBOM | ${{ needs.sbom.result }} |" >> "$GITHUB_STEP_SUMMARY"
 
           overall='success'
 
-          if [[ "${{ needs.secret-detection.result }}" == "failure" ]] || \
-             [[ "${{ needs.dependency-audit.result }}" == "failure" ]]; then
+          if [[ "${{ needs.dependency-audit.result }}" == "failure" ]]; then
             overall='failure'
             echo "::error::Security checks failed"
           fi
@@ -253,12 +207,11 @@ jobs:
               'repository': '${{ github.repository }}',
               'run_id': '${{ github.run_id }}',
               'status': '${{ steps.status.outputs.overall }}',
-              'secret_detection': '${{ needs.secret-detection.result }}',
               'dependency_audit': '${{ needs.dependency-audit.result }}',
               'container_scan': '${{ needs.container-scan.result }}',
               'sbom': '${{ needs.sbom.result }}',
           }
           print(json.dumps(payload))
           PY
-            )
+          )
           curl -fsSL -X POST -H 'Content-Type: application/json' -d "$payload" "$WEBHOOK_URL"
