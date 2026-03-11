@@ -202,7 +202,7 @@ main() {
   local enable_e2e=false
   local enable_security=false
   local enable_pr_quality=false
-  local enable_codeql=false
+
   local enable_ai_code_review=false
   local enable_deploy_staging=false
   local enable_deploy_prod=false
@@ -221,7 +221,7 @@ main() {
   ask_yes_no "  E2E Tests (Playwright)" "n" && enable_e2e=true
   ask_yes_no "  Security Scans (secrets, deps, containers)" "y" && enable_security=true
   ask_yes_no "  PR Quality Gate" "y" && enable_pr_quality=true
-  ask_yes_no "  CodeQL Analysis" "n" && enable_codeql=true
+
   ask_yes_no "  AI Code Review" "n" && enable_ai_code_review=true
 
   if [ "$has_docker" = "true" ]; then
@@ -285,12 +285,6 @@ main() {
     render_template "pr-quality.yml.tmpl" ".github/workflows/pr-quality.yml"
   fi
 
-  if [ "$enable_codeql" = "true" ]; then
-    render_template \
-      "codeql.yml.tmpl" \
-      ".github/workflows/codeql.yml" \
-      BASE_BRANCH "$base_branch"
-  fi
 
   if [ "$enable_ai_code_review" = "true" ]; then
     render_template "ai-code-review.yml.tmpl" ".github/workflows/ai-code-review.yml"

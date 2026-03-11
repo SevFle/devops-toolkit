@@ -70,7 +70,7 @@ jobs:
             'ai-release-notes.yml': 'ai-release-notes.yml.tmpl',
             'ai-api-compat.yml': 'ai-api-compat.yml.tmpl',
             'ai-tech-debt.yml': 'ai-tech-debt.yml.tmpl',
-            'codeql.yml': 'codeql.yml.tmpl',
+
           }
 
           template_dir = Path('init/templates')
