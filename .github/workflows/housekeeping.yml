@@ -64,6 +64,14 @@ jobs:
           if [ -z "$STALE_ISSUES" ]; then
             echo "No stale issues found." >> "$GITHUB_STEP_SUMMARY"
           else
+            if [ "$DRY_RUN" != "true" ]; then
+              if ! gh label list --limit 1000 --json name --jq '.[].name' | grep -Fxq "stale"; then
+                gh label create "stale" --color "cfd3d7" --description "No recent activity"
+                echo "Created missing \`stale\` label." >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+
             echo "| Issue | Title | Action |" >> "$GITHUB_STEP_SUMMARY"
             echo "|-------|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
 
